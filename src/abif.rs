@@ -94,7 +94,10 @@ pub fn parse(f: &[u8]) -> Result<Trace, String> {
     let order = match find(b"FWO_", &[1]) {
         Some(e) => {
             bytes_of(e, "the channel order")?;
-            let o = e.data[..e.count].to_ascii_uppercase();
+            if e.count != 4 {
+                return Err("the channel order (FWO_) is not a permutation of ACGT".into());
+            }
+            let o = e.data[..4].to_ascii_uppercase();
             let mut sorted = o.clone();
             sorted.sort_unstable();
             if sorted != b"ACGT" {

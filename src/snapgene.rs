@@ -158,7 +158,8 @@ fn features(xml: &str, n: usize, circular: bool) -> Result<(Vec<Feature>, usize)
         let body_end = if tag.ends_with('/') { 0 } else { rest.find("</Feature>").ok_or("an unterminated feature")? };
         let body = &rest[close..body_end.max(close)];
         // Every segment must lie on the sequence, or the feature is skipped (and counted) rather than shortened.
-        let mut segments: Vec<(usize, usize)> = Vec::new();
+        // Pieces are (start, end, bases covered): the count, not the endpoints, says when a join has gone round.
+        let mut segments: Vec<(usize, usize, usize)> = Vec::new();
         let mut color = None;
         let mut valid = true;
         let mut b = body;
@@ -168,17 +169,15 @@ fn features(xml: &str, n: usize, circular: bool) -> Result<(Vec<Feature>, usize)
             let seg = &b[..end];
             match attr(seg, "range").and_then(|r| range(&r, n, circular)) {
                 Some(r) => {
-                    // A segment that continues the previous one (also across the origin of a circle) extends it.
+                    let len = if r.1 > r.0 { r.1 - r.0 } else { n - r.0 + r.1 };
+                    // A segment that continues the previous one (also across the origin of a circle) extends it; a
+                    // piece that has covered a whole turn is the whole circle and stays so.
                     match segments.last_mut() {
+                        Some(last) if last.2 >= n => {}
                         Some(last) if last.1 == r.0 || (circular && last.1 == n && r.0 == 0) => {
-                            last.1 = r.1;
-                            // Joined all the way round (it ends where it starts, or wraps past its start): the whole circle.
-                            let len = if last.1 > last.0 { last.1 - last.0 } else { n - last.0 + last.1 };
-                            if last.1 == last.0 || len >= n {
-                                *last = (0, n);
-                            }
+                            *last = if last.2 + len >= n { (0, n, n) } else { (last.0, r.1, last.2 + len) };
                         }
-                        _ => segments.push(r),
+                        _ => segments.push((r.0, r.1, len)),
                     }
                     if color.is_none() {
                         color = attr(seg, "color").filter(|c| c.len() <= 32);
@@ -205,7 +204,7 @@ fn features(xml: &str, n: usize, circular: bool) -> Result<(Vec<Feature>, usize)
         let kind: String = attr(tag, "type").unwrap_or_else(|| "misc_feature".into()).chars().take(40).collect();
         // Separate segments stay separate (one annotation each, numbered), so the gaps between them stay uncovered.
         let parts = segments.len();
-        for (i, (start, end)) in segments.into_iter().enumerate() {
+        for (i, (start, end, _)) in segments.into_iter().enumerate() {
             let name = if parts == 1 { name.clone() } else { format!("{name} (part {} of {parts})", i + 1) };
             out.push(Feature { name, kind: kind.clone(), start, end, direction, color: color.clone() });
         }
@@ -305,9 +304,42 @@ mod tests {
         // Joined segments that go all the way round are the whole circle, never an empty range.
         assert_eq!(feats(&one(r#"<Segment range="9-10"/><Segment range="1-2"/><Segment range="3-8"/>"#), 1), (vec![("f".into(), 0, 10)], 0));
         assert_eq!(feats(&one(r#"<Segment range="5-8"/><Segment range="9-4"/>"#), 1), (vec![("f".into(), 0, 10)], 0));
+        // ... also when they go past their start.
+        for segs in [r#"<Segment range="9-10"/><Segment range="1-9"/>"#, r#"<Segment range="5-8"/><Segment range="9-6"/>"#,
+            r#"<Segment range="1-10"/><Segment range="1-2"/>"#, r#"<Segment range="9-2"/><Segment range="3-9"/>"#] {
+            assert_eq!(feats(&one(segs), 1), (vec![("f".into(), 0, 10)], 0), "{segs}");
+        }
         // One segment off the sequence skips the whole feature; a wrapping range on a linear sequence too.
         assert_eq!(feats(&one(r#"<Segment range="1-2"/><Segment range="9-12"/>"#), 1), (vec![], 1));
         assert_eq!(feats(&one(r#"<Segment range="9-2"/>"#), 0), (vec![], 1));
+    }
+
+    // The bases a feature's annotations cover equal the bases its segments cover, for any segments on a circle.
+    #[test]
+    fn annotations_cover_exactly_the_segments() {
+        let covered = |n: usize, ranges: &[(usize, usize)]| {
+            let mut on = vec![false; n];
+            for &(s, e) in ranges {
+                let len = if e > s { e - s } else { n - s + e };
+                for k in 0..len {
+                    on[(s + k) % n] = true;
+                }
+            }
+            on
+        };
+        let mut x = 5u64;
+        let mut next = |m: u64| { x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (x >> 33) % m };
+        for _ in 0..5000 {
+            let n = 3 + next(10) as usize;
+            let segs: Vec<(usize, usize)> = (0..1 + next(4)).map(|_| (1 + next(n as u64) as usize, 1 + next(n as u64) as usize)).collect();
+            let xml = format!(r#"<Features><Feature name="f" type="misc_feature">{}</Feature></Features>"#,
+                segs.iter().map(|(a, b)| format!(r#"<Segment range="{a}-{b}"/>"#)).collect::<String>());
+            let d = parse(&file(&b"ACGTACGTACGTA"[..n], 1, &xml), 100).unwrap();
+            // Expected: the bases of the 1-based inclusive segments (a > b wraps; b = a - 1 is the whole circle).
+            let want = covered(n, &segs.iter().map(|&(a, b)| if a <= b { (a - 1, b) } else if b == a - 1 { (0, n) } else { (a - 1, b) }).collect::<Vec<_>>());
+            let got = covered(n, &d.features.iter().map(|f| (f.start, f.end)).collect::<Vec<_>>());
+            assert_eq!((got, d.skipped), (want, 0), "n={n} {segs:?}");
+        }
     }
 
     #[test]
