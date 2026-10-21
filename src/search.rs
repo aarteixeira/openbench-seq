@@ -190,10 +190,7 @@ mod tests {
         let pat = b"GANTC";
         let direct = |p: &[u8]| {
             (0..=seq.len() - p.len())
-                .filter_map(|i| {
-                    let d = p.iter().enumerate().filter(|(j, q)| !satisfies(mask(seq[i + j]), mask(**q))).count();
-                    (d <= 1).then_some(i)
-                })
+                .filter(|&i| p.iter().enumerate().filter(|(j, q)| !satisfies(mask(seq[i + j]), mask(**q))).count() <= 1)
                 .count()
         };
         let got = search(&seq, pat, 1, false, false).unwrap();

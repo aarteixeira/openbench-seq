@@ -22,6 +22,8 @@ pub struct Dna {
     pub seq: String,
     pub circular: bool,
     pub features: Vec<Feature>,
+    /// Features left out because none of their segments lies within the sequence; the caller says so.
+    pub skipped: usize,
 }
 
 pub fn parse(bytes: &[u8], max_len: usize) -> Result<Dna, String> {
@@ -63,11 +65,11 @@ pub fn parse(bytes: &[u8], max_len: usize) -> Result<Dna, String> {
         }
     }
     let (seq, circular) = dna.ok_or("the file has no sequence")?;
-    let features = match xml {
+    let (features, skipped) = match xml {
         Some(x) => features(&String::from_utf8_lossy(x), seq.len())?,
-        None => vec![],
+        None => (vec![], 0),
     };
-    Ok(Dna { seq, circular, features })
+    Ok(Dna { seq, circular, features, skipped })
 }
 
 // Attribute `name` of the tag text starting after `<Tag`.
@@ -134,8 +136,9 @@ fn range(r: &str, n: usize) -> Option<(usize, usize)> {
     (a >= 1 && b >= 1 && a <= n && b <= n).then_some((a - 1, b))
 }
 
-fn features(xml: &str, n: usize) -> Result<Vec<Feature>, String> {
+fn features(xml: &str, n: usize) -> Result<(Vec<Feature>, usize), String> {
     let mut out = Vec::new();
+    let mut skipped = 0;
     let mut rest = xml;
     while let Some(i) = rest.find("<Feature ") {
         rest = &rest[i + 9..];
@@ -159,7 +162,10 @@ fn features(xml: &str, n: usize) -> Result<Vec<Feature>, String> {
             b = &b[end..];
         }
         rest = &rest[body_end.max(close)..];
-        let (Some(&(start, _)), Some(&(_, end))) = (segments.first(), segments.last()) else { continue };
+        let (Some(&(start, _)), Some(&(_, end))) = (segments.first(), segments.last()) else {
+            skipped += 1;
+            continue;
+        };
         if out.len() == MAX_FEATURES {
             return Err(format!("more than {MAX_FEATURES} features"));
         }
@@ -174,7 +180,7 @@ fn features(xml: &str, n: usize) -> Result<Vec<Feature>, String> {
         let end = if end == start { n } else { end };
         out.push(Feature { name, kind, start, end, direction, color });
     }
-    Ok(out)
+    Ok((out, skipped))
 }
 
 pub fn to_json(d: &Dna) -> String {
@@ -182,6 +188,7 @@ pub fn to_json(d: &Dna) -> String {
     s.push_str("{\"seq\":");
     json::string(&mut s, &d.seq);
     s.push_str(if d.circular { ",\"circular\":true" } else { ",\"circular\":false" });
+    s.push_str(&format!(",\"skipped\":{}", d.skipped));
     s.push_str(",\"features\":[");
     for (i, f) in d.features.iter().enumerate() {
         if i > 0 {
@@ -248,6 +255,7 @@ mod tests {
             ("split", "misc_feature", 0, 6, 0),
         ]);
         assert_eq!(d.features[0].color.as_deref(), Some("#ffffff"));
+        assert_eq!(d.skipped, 1); // "outside" lies past the end
         assert_eq!(to_json(&d).matches("\"name\"").count(), 3);
     }
 
@@ -257,7 +265,7 @@ mod tests {
         f.extend(packet(0x00, b"\x00ACGT"));
         let d = parse(&f, 10).unwrap();
         assert!(!d.circular && d.features.is_empty());
-        assert_eq!(to_json(&d), r#"{"seq":"ACGT","circular":false,"features":[]}"#);
+        assert_eq!(to_json(&d), r#"{"seq":"ACGT","circular":false,"skipped":0,"features":[]}"#);
     }
 
     #[test]
@@ -274,5 +282,19 @@ mod tests {
         lie.extend([0x00, 0xff, 0xff, 0xff, 0xff, 0x00]);
         assert_eq!(parse(&lie, 10).unwrap_err(), "a packet is longer than the file");
         assert!(parse(&file(b"AC<T", 0, ""), 10).unwrap_err().contains("not bases"));
+    }
+
+    #[test]
+    fn mutated_files_give_an_error_or_a_result_never_a_panic() {
+        let f = file(b"ACGTACGTAC", 0x03, XML);
+        let mut x = 11u64;
+        for _ in 0..20_000 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let mut g = f.clone();
+            let at = (x >> 33) as usize % g.len();
+            g[at] = (x >> 17) as u8;
+            let cut = if x & 1 == 0 { g.len() } else { (x >> 40) as usize % (g.len() + 1) };
+            let _ = parse(&g[..cut], 1000);
+        }
     }
 }

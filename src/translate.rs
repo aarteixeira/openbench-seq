@@ -85,7 +85,8 @@ fn strand_orfs(code: &[u8; 64], s: &[u8], circular: bool, min_aa: usize) -> Vec<
     }
     // A circle is scanned twice over, so every stop sees up to a whole turn of upstream context in its own frame.
     let text: Vec<u8> = if circular { [s, s].concat() } else { s.to_vec() };
-    let mut best: Vec<Option<(usize, usize)>> = vec![None; n]; // by stop position mod n: (start, aa)
+    // By stop position mod n: (start, aa). Sparse, so a long sequence costs memory per ORF, not per base.
+    let mut best: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
     for frame in 0..3 {
         let mut first_atg: Option<usize> = None;
         let mut i = frame;
@@ -97,13 +98,13 @@ fn strand_orfs(code: &[u8; 64], s: &[u8], circular: bool, min_aa: usize) -> Vec<
                     let len = (i - a) / 3;
                     // A real ORF starts on the first turn and is shorter than the circle.
                     if a < n && i + 3 - a <= n && len >= min_aa {
-                        let slot = &mut best[i % n];
-                        if slot.is_none_or(|(_, l)| len > l) {
-                            *slot = Some((a, len));
+                        let slot = best.entry(i % n).or_insert((a, len));
+                        if len > slot.1 {
+                            *slot = (a, len);
                         }
                     }
                 }
-            } else if first_atg.is_none() && c == b"ATG" {
+            } else if first_atg.is_none() && (c == b"ATG" || c == b"AUG") {
                 first_atg = Some(i);
             } else if let Some(a) = first_atg {
                 // Longer than a whole turn: no stop on this circle in this frame; drop it.
@@ -114,15 +115,15 @@ fn strand_orfs(code: &[u8; 64], s: &[u8], circular: bool, min_aa: usize) -> Vec<
             i += 3;
         }
     }
-    best.iter()
-        .enumerate()
-        .filter_map(|(stop, b)| {
-            b.map(|(a, len)| {
-                let e = stop + 3;
-                (a, if e > n { e - n } else { e }, len)
-            })
+    let mut out: Vec<_> = best
+        .into_iter()
+        .map(|(stop, (a, len))| {
+            let e = stop + 3;
+            (a, if e > n { e - n } else { e }, len)
         })
-        .collect()
+        .collect();
+    out.sort_unstable();
+    out
 }
 
 #[cfg(test)]
@@ -178,6 +179,11 @@ mod tests {
         let seq = revcomp(b"AAATAGCCCCATGAAA"); // TTTCATGGGGCTATTT
         let o = orfs(std(), &seq, true, 3);
         assert_eq!(o, vec![Orf { start: 10, end: 6, strand: -1, aa: 3 }]);
+    }
+
+    #[test]
+    fn rna_start_codon() {
+        assert_eq!(orfs(std(), b"AUGAAAUAA", false, 1), vec![Orf { start: 0, end: 9, strand: 1, aa: 2 }]);
     }
 
     #[test]

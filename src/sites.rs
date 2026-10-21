@@ -30,53 +30,39 @@ pub struct Cut {
     pub blocked: u8,
 }
 
-// Methylated top-strand positions per kind, as prefix sums for window queries.
-struct Methylation {
-    prefix: [Vec<u32>; 3],
-}
+// (kind, motif, offsets of methylated bases on the top strand, counting the base paired to a methylated bottom-strand
+// base as that position). Dam: GATC, A on both strands -> 1 and 2. Dcm: CCWGG, inner C on both strands -> 1 and 3.
+// CpG: CG, C on both strands -> 0 and 1.
+const METHYLATION: [(u8, &[u8], &[usize]); 3] = [(DAM, b"GATC", &[1, 2]), (DCM, b"CCWGG", &[1, 3]), (CPG, b"CG", &[0, 1])];
 
-impl Methylation {
-    fn new(text: &[u8], n: usize, circular: bool) -> Self {
-        // (motif, offsets of methylated bases on the top strand, counting the base paired to a methylated
-        // bottom-strand base as that position). Dam: GATC, A on both strands -> 1 and 2. Dcm: CCWGG, inner C on both
-        // strands -> 1 and 3. CpG: CG, C on both strands -> 0 and 1.
-        let kinds: [(&[u8], &[usize]); 3] = [(b"GATC", &[1, 2]), (b"CCWGG", &[1, 3]), (b"CG", &[0, 1])];
-        let len = text.len();
-        let prefix = kinds.map(|(motif, offs)| {
-            let mut marked = vec![false; len];
-            let last = if circular { n } else { len.saturating_sub(motif.len() - 1) };
-            for i in 0..last {
-                if i + motif.len() <= len && motif.iter().enumerate().all(|(j, &q)| satisfies(mask(text[i + j]), mask(q))) {
-                    for &o in offs {
-                        marked[(i + o) % if circular { n } else { len }] = true;
-                    }
-                }
-            }
-            if circular {
-                // The text repeats the start of the circle after n; mirror the marks there.
-                for i in n..len {
-                    marked[i] = marked[i - n];
-                }
-            }
-            let mut p = vec![0u32; len + 1];
-            for i in 0..len {
-                p[i + 1] = p[i] + marked[i] as u32;
-            }
-            p
-        });
-        Methylation { prefix }
-    }
-
-    fn blocked(&self, start: usize, len: usize, sensitive: u8) -> u8 {
-        let mut b = 0;
-        for (k, bit) in [DAM, DCM, CPG].into_iter().enumerate() {
-            let p = &self.prefix[k];
-            if sensitive & bit != 0 && p[start + len] > p[start] {
+// The methylations (of those the enzyme is sensitive to) that modify a base inside the site at text[start..start+len].
+// Only motifs that can reach the window are read, so the cost is per site, not per base.
+fn blocked(text: &[u8], n: usize, circular: bool, start: usize, len: usize, sensitive: u8) -> u8 {
+    let at = |p: usize| if circular { Some(text[p % n]) } else { text.get(p).copied() };
+    let mut b = 0;
+    for (bit, motif, offs) in METHYLATION {
+        if sensitive & bit == 0 {
+            continue;
+        }
+        // A motif starting at m modifies m + o; that lies in the window for m in [start - max(o), start + len).
+        let reach = offs.iter().max().copied().unwrap_or(0);
+        let from = if circular { start + n - reach } else { start.saturating_sub(reach) };
+        let to = if circular { start + n + len } else { start + len };
+        for m in from..to {
+            let hit = motif.iter().enumerate().all(|(j, &q)| at(m + j).is_some_and(|c| satisfies(mask(c), mask(q))));
+            let inside = offs.iter().any(|&o| {
+                let p = if circular { (m + o) % n } else { m + o };
+                let w = if circular { start % n } else { start };
+                // Inside [w, w + len), the window possibly crossing the origin of a circle.
+                if circular { (p + n - w) % n < len } else { p >= w && p < w + len }
+            });
+            if hit && inside {
                 b |= bit;
+                break;
             }
         }
-        b
     }
+    b
 }
 
 /// Cut positions of every enzyme, sorted by enzyme then position; each position once per enzyme.
@@ -85,7 +71,6 @@ pub fn cuts(seq: &[u8], circular: bool, enzymes: &[Enzyme]) -> Vec<Cut> {
     let longest = enzymes.iter().map(|e| e.site.len()).max().unwrap_or(1).max(5);
     // Circular text repeats enough of the start for sites and methylation motifs across the origin.
     let text: Vec<u8> = if circular { [seq, &seq[..(longest - 1).min(n)]].concat() } else { seq.to_vec() };
-    let meth = Methylation::new(&text, n, circular);
     let mut out = Vec::new();
     for (ei, e) in enzymes.iter().enumerate() {
         let l = e.site.len();
@@ -111,7 +96,7 @@ pub fn cuts(seq: &[u8], circular: bool, enzymes: &[Enzyme]) -> Vec<Cut> {
                 } else {
                     continue;
                 };
-                found.push((pos, meth.blocked(i, l, e.sensitive)));
+                found.push((pos, blocked(seq, n, circular, i, l, e.sensitive)));
             }
         }
         found.sort();

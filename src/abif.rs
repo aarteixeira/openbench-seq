@@ -48,7 +48,7 @@ fn entry<'a>(f: &'a [u8], at: usize) -> Result<Entry<'a>, String> {
         f.get(off..off.checked_add(size).ok_or("a directory entry overflows")?).ok_or("a directory entry points past the end of the file")?
     };
     let (count, elsize) = (count as usize, elsize as usize);
-    if count.checked_mul(elsize).is_none_or(|n| n > data.len()) {
+    if (elsize == 0 && count > 0) || count.checked_mul(elsize).is_none_or(|n| n > data.len()) {
         return Err("a directory entry is larger than its data".into());
     }
     Ok(Entry { name: e[..4].try_into().unwrap(), number: i32::from_be_bytes(e[4..8].try_into().unwrap()), count, elsize, data })
@@ -67,6 +67,8 @@ pub fn parse(f: &[u8]) -> Result<Trace, String> {
     let find = |name: &[u8; 4], numbers: &[i32]| numbers.iter().find_map(|&n| entries.iter().find(|e| &e.name == name && e.number == n));
 
     let bases = find(b"PBAS", &[2, 1]).ok_or("the file has no base calls")?;
+    let bytes_of = |e: &Entry, what: &str| if e.elsize == 1 { Ok(()) } else { Err(format!("{what} have an unexpected element size")) };
+    bytes_of(bases, "base calls")?;
     if bases.count > MAX_BASES {
         return Err(format!("more than {MAX_BASES} base calls"));
     }
@@ -74,13 +76,19 @@ pub fn parse(f: &[u8]) -> Result<Trace, String> {
     if !bases_text.iter().all(|b| b.is_ascii_alphabetic() || *b == b'-') {
         return Err("the base calls hold characters that are not bases".into());
     }
-    let quality = find(b"PCON", &[2, 1]).map(|e| e.data[..e.count].to_vec()).unwrap_or_default();
+    let quality = match find(b"PCON", &[2, 1]) {
+        Some(e) => { bytes_of(e, "qualities")?; e.data[..e.count].to_vec() }
+        None => vec![],
+    };
     let peaks = match find(b"PLOC", &[2, 1]) {
         Some(e) if e.elsize == 2 => e.data[..2 * e.count].chunks_exact(2).map(|c| i16::from_be_bytes([c[0], c[1]]) as i32).collect(),
         Some(_) => return Err("peak positions have an unexpected element size".into()),
         None => vec![],
     };
-    let order = find(b"FWO_", &[1]).map(|e| e.data[..e.count.min(4)].to_vec()).unwrap_or_else(|| b"GATC".to_vec());
+    let order = match find(b"FWO_", &[1]) {
+        Some(e) => { bytes_of(e, "the channel order")?; e.data[..e.count.min(4)].to_vec() }
+        None => b"GATC".to_vec(),
+    };
     let mut channels: [Vec<i16>; 4] = Default::default();
     for (i, base) in order.iter().enumerate() {
         let slot = match base.to_ascii_uppercase() {
@@ -217,5 +225,33 @@ mod tests {
         lie[dir_at + 28 + 20..dir_at + 28 + 24].copy_from_slice(&i32::MAX.to_be_bytes());
         assert!(parse(&lie).unwrap_err().contains("past the end"));
         assert_eq!(parse(&abif(&[(b"PCON", 2, 2, 1, &[1])])).unwrap_err(), "the file has no base calls");
+    }
+
+    #[test]
+    fn element_sizes_are_checked_before_slicing() {
+        // A zero element size with a count (1 x 0 fits in 0 bytes) must not reach a slice by count.
+        let mut f = abif(&[(b"PBAS", 2, 2, 1, b"ACGTA")]);
+        let dir_at = i32::from_be_bytes(f[26..30].try_into().unwrap()) as usize;
+        f[dir_at + 10..dir_at + 12].copy_from_slice(&0i16.to_be_bytes()); // element size 0
+        f[dir_at + 16..dir_at + 20].copy_from_slice(&0i32.to_be_bytes()); // data size 0
+        assert!(parse(&f).unwrap_err().contains("larger than its data"));
+        // Base calls stored as 2-byte elements are refused, not sliced as bytes.
+        assert!(parse(&abif(&[(b"PBAS", 2, 4, 2, b"ACGT")])).unwrap_err().contains("element size"));
+        assert!(parse(&abif(&[(b"PBAS", 2, 2, 1, b"ACGTA"), (b"PCON", 2, 4, 2, b"\0\x01")])).unwrap_err().contains("element size"));
+    }
+
+    #[test]
+    fn mutated_files_give_an_error_or_a_result_never_a_panic() {
+        // Untrusted input: every single-byte change and truncation of a valid file must come back as Ok or Err.
+        let f = sample();
+        let mut x = 7u64;
+        for _ in 0..20_000 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let mut g = f.clone();
+            let at = (x >> 33) as usize % g.len();
+            g[at] = (x >> 17) as u8;
+            let cut = if x & 1 == 0 { g.len() } else { (x >> 40) as usize % (g.len() + 1) };
+            let _ = parse(&g[..cut]);
+        }
     }
 }
