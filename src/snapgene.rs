@@ -1,6 +1,7 @@
 //! SnapGene `.dna` files: a sequence of packets (type byte, big-endian u32 length, data). Read here: the cookie
-//! (0x09, "SnapGene", sequence type 1 = DNA), the sequence (0x00: a flags byte, bit 0 = circular, then ASCII bases)
-//! and the features (0x0A: XML). Other packets are skipped by length.
+//! (0x09, "SnapGene", sequence type 1 = DNA), the sequence (0x00: a flags byte, bit 0 = circular, then ASCII bases),
+//! the features (0x0A: XML) and the primers (0x05: XML, their binding sites as `primer_bind` features). Other packets
+//! are skipped by length. Checked against Biopython's SnapGene test files and expectations (tests below).
 
 use crate::json;
 
@@ -31,6 +32,7 @@ pub fn parse(bytes: &[u8], max_len: usize) -> Result<Dna, String> {
     let mut cookie = false;
     let mut dna: Option<(String, bool)> = None;
     let mut xml: Option<&[u8]> = None;
+    let mut primer_xml: Option<&[u8]> = None;
     while at < bytes.len() {
         if bytes.len() - at < 5 {
             return Err("the file ends inside a packet header".into());
@@ -61,14 +63,22 @@ pub fn parse(bytes: &[u8], max_len: usize) -> Result<Dna, String> {
                 dna = Some((String::from_utf8_lossy(seq).to_ascii_uppercase(), flags & 1 == 1));
             }
             0x0A => xml = Some(body),
+            0x05 => primer_xml = Some(body),
             _ => {}
         }
     }
     let (seq, circular) = dna.ok_or("the file has no sequence")?;
-    let (features, skipped) = match xml {
+    let (mut features, skipped) = match xml {
         Some(x) => features(&String::from_utf8_lossy(x), seq.len(), circular)?,
         None => (vec![], 0),
     };
+    if let Some(x) = primer_xml {
+        let found = primers(&String::from_utf8_lossy(x), seq.len(), circular);
+        if features.len() + found.len() > MAX_FEATURES {
+            return Err(format!("more than {MAX_FEATURES} features"));
+        }
+        features.extend(found);
+    }
     Ok(Dna { seq, circular, features, skipped })
 }
 
@@ -167,6 +177,11 @@ fn features(xml: &str, n: usize, circular: bool) -> Result<(Vec<Feature>, usize)
             b = &b[j + 9..];
             let end = b.find('>').ok_or("an unterminated segment tag")?;
             let seg = &b[..end];
+            // A gap segment marks the stretch between two parts: not covered by the feature.
+            if attr(seg, "type").as_deref() == Some("gap") {
+                b = &b[end..];
+                continue;
+            }
             match attr(seg, "range").and_then(|r| range(&r, n, circular)) {
                 Some(r) => {
                     let len = if r.1 > r.0 { r.1 - r.0 } else { n - r.0 + r.1 };
@@ -202,14 +217,70 @@ fn features(xml: &str, n: usize, circular: bool) -> Result<(Vec<Feature>, usize)
         };
         let name: String = attr(tag, "name").unwrap_or_else(|| "feature".into()).chars().take(200).collect();
         let kind: String = attr(tag, "type").unwrap_or_else(|| "misc_feature".into()).chars().take(40).collect();
-        // Separate segments stay separate (one annotation each, numbered), so the gaps between them stay uncovered.
+        // Separate segments stay separate (one annotation each, numbered), so the gaps between them stay uncovered. Parts
+        // are numbered in reading order: from the last segment on the reverse strand.
         let parts = segments.len();
         for (i, (start, end, _)) in segments.into_iter().enumerate() {
-            let name = if parts == 1 { name.clone() } else { format!("{name} (part {} of {parts})", i + 1) };
+            let k = if direction == -1 { parts - i } else { i + 1 };
+            let name = if parts == 1 { name.clone() } else { format!("{name} (part {k} of {parts})") };
             out.push(Feature { name, kind: kind.clone(), start, end, direction, color: color.clone() });
         }
     }
     Ok((out, skipped))
+}
+
+// Primer binding sites as `primer_bind` features, as SnapGene shows them: a site whose annealed bases or melting
+// temperature fall short of the file's hybridization parameters is not shown, nor a "simplified" site repeating one
+// already listed. Binding-site locations are 0-based and inclusive ("751-775" is [751, 776)), unlike segments; a
+// site bound to the bottom strand (boundStrand 1) is a reverse primer. A site outside the sequence is left out.
+fn primers(xml: &str, n: usize, circular: bool) -> Vec<Feature> {
+    let num = |s: Option<String>| s.and_then(|v| v.trim().parse::<i64>().ok());
+    let (mut min_len, mut min_tm) = (0, 0);
+    if let Some(i) = xml.find("<HybridizationParams") {
+        let tag = &xml[i + 20..xml[i..].find('>').map_or(xml.len(), |e| i + e)];
+        min_len = num(attr(tag, "minContinuousMatchLen")).unwrap_or(0);
+        min_tm = num(attr(tag, "minMeltingTemperature")).unwrap_or(0);
+    }
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(i) = rest.find("<Primer ") {
+        rest = &rest[i + 8..];
+        let Some(close) = rest.find('>') else { break };
+        let tag = &rest[..close];
+        let body_end = if tag.ends_with('/') { close } else { rest.find("</Primer>").unwrap_or(rest.len()) };
+        let body = &rest[close..body_end.max(close)];
+        let name: String = attr(tag, "name").unwrap_or_else(|| "primer".into()).chars().take(200).collect();
+        let mut seen: Vec<(usize, usize, i8)> = Vec::new();
+        let mut b = body;
+        while let Some(j) = b.find("<BindingSite ") {
+            b = &b[j + 13..];
+            let Some(end) = b.find('>') else { break };
+            let site = &b[..end];
+            b = &b[end..];
+            let Some((s0, s1)) = attr(site, "location").and_then(|l| {
+                let (a, z) = l.split_once('-')?;
+                Some((a.trim().parse::<usize>().ok()?, z.trim().parse::<usize>().ok()?))
+            }) else { continue };
+            if s0 >= n || s1 >= n || (s0 > s1 && !circular) {
+                continue;
+            }
+            // Across the origin of a circle when s0 > s1; one base short of a full turn reads as the whole circle.
+            let (start, end) = if s0 <= s1 || s1 + 1 != s0 { (s0, s1 + 1) } else { (0, n) };
+            let direction = if attr(site, "boundStrand").as_deref() == Some("1") { -1 } else { 1 };
+            if attr(site, "simplified").as_deref() == Some("1") && seen.contains(&(start, end, direction)) {
+                continue;
+            }
+            if attr(site, "annealedBases").is_some_and(|a| (a.len() as i64) < min_len)
+                || num(attr(site, "meltingTemperature")).is_some_and(|t| t < min_tm)
+            {
+                continue;
+            }
+            seen.push((start, end, direction));
+            out.push(Feature { name: name.clone(), kind: "primer_bind".into(), start, end, direction, color: None });
+        }
+        rest = &rest[body_end.max(close)..];
+    }
+    out
 }
 
 pub fn to_json(d: &Dna) -> String {
@@ -389,5 +460,31 @@ mod tests {
             let cut = if x & 1 == 0 { g.len() } else { (x >> 40) as usize % (g.len() + 1) };
             let _ = parse(&g[..cut], 1000);
         }
+    }
+
+    #[test]
+    fn gap_segments_are_not_covered_and_reverse_parts_count_from_the_end() {
+        let xml = r#"<Features><Feature name="t" directionality="2" type="terminator"><Segment range="3-4" type="standard"/><Segment range="5-6" type="gap"/><Segment range="7-8" type="standard"/><Segment range="9-10" type="standard"/></Feature></Features>"#;
+        let d = parse(&file(b"ACGTACGTACGT", 0, xml), 100).unwrap();
+        let got: Vec<_> = d.features.iter().map(|f| (f.name.as_str(), f.start, f.end, f.direction)).collect();
+        assert_eq!(got, [("t (part 2 of 2)", 2, 4, -1), ("t (part 1 of 2)", 6, 10, -1)]);
+    }
+
+    #[test]
+    fn primer_sites_are_zero_based_filtered_and_stranded() {
+        let primers = r#"<Primers><HybridizationParams minContinuousMatchLen="10" minMeltingTemperature="40"/>
+<Primer name="P1"><BindingSite location="2-5" boundStrand="0" annealedBases="ACGTACGTACGT" meltingTemperature="52"/>
+<BindingSite simplified="1" location="2-5" boundStrand="0" annealedBases="ACGTACGTACGT" meltingTemperature="52"/>
+<BindingSite location="8-1" boundStrand="1" annealedBases="ACGTACGTACGT" meltingTemperature="60"/>
+<BindingSite location="3-6" boundStrand="0" annealedBases="ACG" meltingTemperature="60"/>
+<BindingSite location="3-7" boundStrand="0" annealedBases="ACGTACGTACGT" meltingTemperature="20"/>
+<BindingSite location="3-70" boundStrand="0" annealedBases="ACGTACGTACGT" meltingTemperature="60"/></Primer></Primers>"#;
+        let mut f = file(b"ACGTACGTACGT", 1, "<Features/>");
+        f.extend(packet(0x05, primers.as_bytes()));
+        let d = parse(&f, 100).unwrap();
+        let got: Vec<_> = d.features.iter().map(|f| (f.kind.as_str(), f.start, f.end, f.direction)).collect();
+        // [2, 6) forward once (the simplified repeat dropped); [8, 2) across the origin, reverse; the short, cold and
+        // out-of-range sites left out.
+        assert_eq!(got, [("primer_bind", 2, 6, 1), ("primer_bind", 8, 2, -1)]);
     }
 }
