@@ -132,7 +132,10 @@ mod tests {
     use super::*;
 
     // A hand-built ABIF file: entries (name, number, element type, element size, count, data).
-    fn abif(tags: &[(&[u8; 4], i32, i16, i16, &[u8])]) -> Vec<u8> {
+    // (name, number, element type, element size, data)
+    type Tag<'a> = (&'a [u8; 4], i32, i16, i16, &'a [u8]);
+
+    fn abif(tags: &[Tag]) -> Vec<u8> {
         let mut data: Vec<u8> = Vec::new();
         let data_start = 34usize;
         let mut dir = Vec::new();
