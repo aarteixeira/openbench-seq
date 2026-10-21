@@ -170,8 +170,14 @@ fn features(xml: &str, n: usize, circular: bool) -> Result<(Vec<Feature>, usize)
                 Some(r) => {
                     // A segment that continues the previous one (also across the origin of a circle) extends it.
                     match segments.last_mut() {
-                        Some(last) if last.1 == r.0 => last.1 = r.1,
-                        Some(last) if circular && last.1 == n && r.0 == 0 && r.1 < last.0 => last.1 = r.1,
+                        Some(last) if last.1 == r.0 || (circular && last.1 == n && r.0 == 0) => {
+                            last.1 = r.1;
+                            // Joined all the way round (it ends where it starts, or wraps past its start): the whole circle.
+                            let len = if last.1 > last.0 { last.1 - last.0 } else { n - last.0 + last.1 };
+                            if last.1 == last.0 || len >= n {
+                                *last = (0, n);
+                            }
+                        }
                         _ => segments.push(r),
                     }
                     if color.is_none() {
@@ -296,6 +302,9 @@ mod tests {
         // Contiguous segments join, also across the origin.
         assert_eq!(feats(&one(r#"<Segment range="1-3"/><Segment range="4-6"/>"#), 1), (vec![("f".into(), 0, 6)], 0));
         assert_eq!(feats(&one(r#"<Segment range="9-10"/><Segment range="1-2"/>"#), 1), (vec![("f".into(), 8, 2)], 0));
+        // Joined segments that go all the way round are the whole circle, never an empty range.
+        assert_eq!(feats(&one(r#"<Segment range="9-10"/><Segment range="1-2"/><Segment range="3-8"/>"#), 1), (vec![("f".into(), 0, 10)], 0));
+        assert_eq!(feats(&one(r#"<Segment range="5-8"/><Segment range="9-4"/>"#), 1), (vec![("f".into(), 0, 10)], 0));
         // One segment off the sequence skips the whole feature; a wrapping range on a linear sequence too.
         assert_eq!(feats(&one(r#"<Segment range="1-2"/><Segment range="9-12"/>"#), 1), (vec![], 1));
         assert_eq!(feats(&one(r#"<Segment range="9-2"/>"#), 0), (vec![], 1));

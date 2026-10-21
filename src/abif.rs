@@ -90,8 +90,18 @@ pub fn parse(f: &[u8]) -> Result<Trace, String> {
     if peaks.first().is_some_and(|&p| p < 0) || peaks.windows(2).any(|w| w[1] < w[0]) {
         return Err("peak positions are not in order".into());
     }
+    // Present, the channel order names each of A, C, G and T once; otherwise a channel would be left unread.
     let order = match find(b"FWO_", &[1]) {
-        Some(e) => { bytes_of(e, "the channel order")?; e.data[..e.count.min(4)].to_vec() }
+        Some(e) => {
+            bytes_of(e, "the channel order")?;
+            let o = e.data[..e.count].to_ascii_uppercase();
+            let mut sorted = o.clone();
+            sorted.sort_unstable();
+            if sorted != b"ACGT" {
+                return Err("the channel order (FWO_) is not a permutation of ACGT".into());
+            }
+            o
+        }
         None => b"GATC".to_vec(),
     };
     let mut channels: [Vec<i16>; 4] = Default::default();
@@ -248,18 +258,19 @@ mod tests {
 
     #[test]
     fn per_base_evidence_must_match_the_calls() {
-        // Qualities and peaks for other counts than the calls, peaks out of order or past the trace, and uneven
-        // channels are refused; one payload shared by large counts never becomes large arrays.
+        // Qualities and peaks for other counts than the calls, peaks out of order or past the trace, uneven channels and
+        // a short channel order are refused.
         let one = |tags: &[Tag]| parse(&abif(tags)).unwrap_err();
         assert!(one(&[(b"PBAS", 2, 2, 1, b"ACGTA"), (b"PCON", 2, 2, 1, &[40, 5])]).contains("2 qualities for 5 base calls"));
         assert!(one(&[(b"PBAS", 2, 2, 1, b"AC"), (b"PLOC", 2, 4, 2, &shorts(&[20, 10]))]).contains("not in order"));
         assert!(one(&[(b"PBAS", 2, 2, 1, b"AC"), (b"PLOC", 2, 4, 2, &shorts(&[1, 7])), (b"DATA", 9, 4, 2, &shorts(&[0; 5])),
             (b"DATA", 10, 4, 2, &shorts(&[0; 5]))]).contains("outside the trace"));
         assert!(one(&[(b"PBAS", 2, 2, 1, b"AC"), (b"DATA", 9, 4, 2, &shorts(&[0; 5])), (b"DATA", 10, 4, 2, &shorts(&[0; 4]))]).contains("differ in length"));
-        let mut aliased = abif(&[(b"PBAS", 2, 2, 1, b"A"), (b"PCON", 2, 2, 1, &[0; 8])]);
-        let dir_at = i32::from_be_bytes(aliased[26..30].try_into().unwrap()) as usize;
-        aliased[dir_at + 28 + 12..dir_at + 28 + 16].copy_from_slice(&100_001i32.to_be_bytes()); // count far past the calls
-        assert!(parse(&aliased).is_err());
+        // A short channel order would leave a channel unread.
+        let four = [(b"DATA", 9), (b"DATA", 10), (b"DATA", 11), (b"DATA", 12)].map(|(n, k)| (n, k, 4i16, 2i16, shorts(&[0; 4])));
+        let mut tags: Vec<Tag> = vec![(b"PBAS", 2, 2, 1, b"AC"), (b"FWO_", 1, 2, 1, b"GAT")];
+        tags.extend(four.iter().map(|(n, k, t, z, d)| (*n, *k, *t, *z, d.as_slice())));
+        assert!(parse(&abif(&tags)).unwrap_err().contains("not a permutation"));
     }
 
     #[test]
