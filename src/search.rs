@@ -43,9 +43,9 @@ fn table(pattern: &[u8], ok: impl Fn(u8, u8) -> bool) -> Box<[u64; 256]> {
 }
 
 // Windows of `text` (starting before `limit`) within k substitutions of the pattern behind `t`, in position order:
-// all are counted, the first `keep` are kept. Returns the count.
-fn scan(text: &[u8], limit: usize, m: usize, k: usize, t: &[u64; 256], strand: i8, keep: usize, out: &mut Vec<Hit>) -> usize {
-    let mut count = 0;
+// all are counted, the first `keep` are kept. Returns the count and the kept hits.
+fn scan(text: &[u8], limit: usize, m: usize, k: usize, t: &[u64; 256], strand: i8, keep: usize) -> (usize, Vec<Hit>) {
+    let (mut count, mut out) = (0, Vec::new());
     let mut r = [0u64; MAX_SUBSTITUTIONS + 1];
     let top = 1u64 << (m - 1);
     for (j, &c) in text.iter().enumerate() {
@@ -68,7 +68,7 @@ fn scan(text: &[u8], limit: usize, m: usize, k: usize, t: &[u64; 256], strand: i
             }
         }
     }
-    count
+    (count, out)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -103,10 +103,8 @@ pub fn search_first(seq: &[u8], pattern: &[u8], k: usize, protein: bool, circula
         return Ok((0, vec![]));
     }
     let text: Vec<u8> = if circular { [seq, &seq[..m - 1]].concat() } else { seq.to_vec() };
-    let mut out = Vec::new();
     if protein {
-        let total = scan(&text, n, m, k, &table(pattern, residue), 1, keep, &mut out);
-        return Ok((total, out));
+        return Ok(scan(&text, n, m, k, &table(pattern, residue), 1, keep));
     }
     let fwd: Vec<u8> = pattern.iter().map(|&b| mask(b)).collect();
     if fwd.contains(&0) {
@@ -114,11 +112,11 @@ pub fn search_first(seq: &[u8], pattern: &[u8], k: usize, protein: bool, circula
     }
     let rev: Vec<u8> = fwd.iter().rev().map(|&q| complement(q)).collect();
     let by_mask = |pat: &[u8]| table(pat, |b, q| satisfies(mask(b), q));
-    let mut total = scan(&text, n, m, k, &by_mask(&fwd), 1, keep, &mut out);
+    let (mut total, mut out) = scan(&text, n, m, k, &by_mask(&fwd), 1, keep);
     if rev != fwd {
         // Each strand's first `keep` hits contain the first `keep` of both together.
-        let mut bottom = Vec::new();
-        total += scan(&text, n, m, k, &by_mask(&rev), -1, keep, &mut bottom);
+        let (count, bottom) = scan(&text, n, m, k, &by_mask(&rev), -1, keep);
+        total += count;
         out.extend(bottom);
         out.sort_by_key(|h| (h.pos, -h.strand));
         out.truncate(keep);
