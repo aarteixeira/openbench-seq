@@ -112,10 +112,10 @@ pub extern "C" fn ob_orfs(circular: u32, min_aa: u32, table: u32) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn ob_search(k: u32, protein: u32, circular: u32, max_hits: u32) -> i32 {
     let (seq, pat) = (input(0), input(1));
-    match search::search(&seq, &pat, k as usize, protein != 0, circular != 0) {
-        Ok(h) => {
-            let mut out = vec![h.len() as i32];
-            out.extend(h.iter().take(max_hits as usize).flat_map(|h| [h.pos as i32, h.strand as i32, h.substitutions as i32]));
+    match search::search_first(&seq, &pat, k as usize, protein != 0, circular != 0, max_hits as usize) {
+        Ok((total, h)) => {
+            let mut out = vec![total.min(i32::MAX as usize) as i32];
+            out.extend(h.iter().flat_map(|h| [h.pos as i32, h.strand as i32, h.substitutions as i32]));
             ints(out)
         }
         Err(e) => fail(-1, format!("{e:?}")),

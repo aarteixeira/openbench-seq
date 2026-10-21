@@ -76,20 +76,26 @@ pub fn parse(f: &[u8]) -> Result<Trace, String> {
     if !bases_text.iter().all(|b| b.is_ascii_alphabetic() || *b == b'-') {
         return Err("the base calls hold characters that are not bases".into());
     }
+    // Qualities and peaks are per base call: present, they have one value per call (checked before anything is read).
+    let per_base = |e: &Entry, what: &str| if e.count == bases.count { Ok(()) } else { Err(format!("{} {what} for {} base calls", e.count, bases.count)) };
     let quality = match find(b"PCON", &[2, 1]) {
-        Some(e) => { bytes_of(e, "qualities")?; e.data[..e.count].to_vec() }
+        Some(e) => { bytes_of(e, "qualities")?; per_base(e, "qualities")?; e.data[..e.count].to_vec() }
         None => vec![],
     };
-    let peaks = match find(b"PLOC", &[2, 1]) {
-        Some(e) if e.elsize == 2 => e.data[..2 * e.count].chunks_exact(2).map(|c| i16::from_be_bytes([c[0], c[1]]) as i32).collect(),
+    let peaks: Vec<i32> = match find(b"PLOC", &[2, 1]) {
+        Some(e) if e.elsize == 2 => { per_base(e, "peak positions")?; e.data[..2 * e.count].chunks_exact(2).map(|c| i16::from_be_bytes([c[0], c[1]]) as i32).collect() }
         Some(_) => return Err("peak positions have an unexpected element size".into()),
         None => vec![],
     };
+    if peaks.first().is_some_and(|&p| p < 0) || peaks.windows(2).any(|w| w[1] < w[0]) {
+        return Err("peak positions are not in order".into());
+    }
     let order = match find(b"FWO_", &[1]) {
         Some(e) => { bytes_of(e, "the channel order")?; e.data[..e.count.min(4)].to_vec() }
         None => b"GATC".to_vec(),
     };
     let mut channels: [Vec<i16>; 4] = Default::default();
+    let mut seen = 0u8;
     for (i, base) in order.iter().enumerate() {
         let slot = match base.to_ascii_uppercase() {
             b'A' => 0,
@@ -102,10 +108,21 @@ pub fn parse(f: &[u8]) -> Result<Trace, String> {
         if e.elsize != 2 || e.count > MAX_POINTS {
             return Err("a trace channel has an unexpected size".into());
         }
-        if !channels[slot].is_empty() {
+        if seen & (1 << slot) != 0 {
             return Err("the channel order (FWO_) is not a permutation of ACGT".into());
         }
+        seen |= 1 << slot;
         channels[slot] = e.data[..2 * e.count].chunks_exact(2).map(|c| i16::from_be_bytes([c[0], c[1]])).collect();
+    }
+    // The channels are one trace sampled four ways: equal lengths, and every peak inside them.
+    let lengths: Vec<usize> = (0..4).filter(|s| seen & (1 << s) != 0).map(|s| channels[s].len()).collect();
+    if lengths.windows(2).any(|w| w[0] != w[1]) {
+        return Err("the trace channels differ in length".into());
+    }
+    if let (Some(&len), Some(&last)) = (lengths.first(), peaks.last()) {
+        if last as usize >= len {
+            return Err("a peak position lies outside the trace".into());
+        }
     }
     let name = find(b"SMPL", &[1])
         .and_then(|e| e.data.split_first().map(|(&l, rest)| String::from_utf8_lossy(&rest[..(l as usize).min(rest.len())]).into_owned()))
@@ -186,7 +203,9 @@ mod tests {
     }
 
     fn sample() -> Vec<u8> {
-        let (g, a, t, c) = (shorts(&[1, 2, 3]), shorts(&[4, 5, 6]), shorts(&[7, 8, 9]), shorts(&[10, 11, 12]));
+        // 64 samples per channel (peaks run to 60); each channel's values start at its own offset.
+        let ch = |o: i16| shorts(&(0..64).map(|i| o + i).collect::<Vec<_>>());
+        let (g, a, t, c) = (ch(100), ch(200), ch(300), ch(400));
         abif(&[
             (b"PBAS", 1, 2, 1, b"NNNNNN"), // superseded by PBAS 2
             (b"PBAS", 2, 2, 1, b"acgtn"),
@@ -209,7 +228,7 @@ mod tests {
         assert_eq!(t.quality, vec![40, 38, 20, 5, 0]);
         assert_eq!(t.peaks, vec![10, 22, 35, 47, 60]);
         // FWO_ GATC: DATA9 is G, 10 A, 11 T, 12 C; channels come back in A, C, G, T order.
-        assert_eq!(t.channels, [vec![4, 5, 6], vec![10, 11, 12], vec![1, 2, 3], vec![7, 8, 9]]);
+        assert_eq!(t.channels.iter().map(|c| (c.len(), c[0])).collect::<Vec<_>>(), vec![(64, 200), (64, 400), (64, 100), (64, 300)]);
         assert!(to_json(&t).starts_with(r#"{"name":"clone12","bases":"ACGTN","quality":[40,38,20,5,0]"#));
     }
 
@@ -225,6 +244,22 @@ mod tests {
         lie[dir_at + 28 + 20..dir_at + 28 + 24].copy_from_slice(&i32::MAX.to_be_bytes());
         assert!(parse(&lie).unwrap_err().contains("past the end"));
         assert_eq!(parse(&abif(&[(b"PCON", 2, 2, 1, &[1])])).unwrap_err(), "the file has no base calls");
+    }
+
+    #[test]
+    fn per_base_evidence_must_match_the_calls() {
+        // Qualities and peaks for other counts than the calls, peaks out of order or past the trace, and uneven
+        // channels are refused; one payload shared by large counts never becomes large arrays.
+        let one = |tags: &[Tag]| parse(&abif(tags)).unwrap_err();
+        assert!(one(&[(b"PBAS", 2, 2, 1, b"ACGTA"), (b"PCON", 2, 2, 1, &[40, 5])]).contains("2 qualities for 5 base calls"));
+        assert!(one(&[(b"PBAS", 2, 2, 1, b"AC"), (b"PLOC", 2, 4, 2, &shorts(&[20, 10]))]).contains("not in order"));
+        assert!(one(&[(b"PBAS", 2, 2, 1, b"AC"), (b"PLOC", 2, 4, 2, &shorts(&[1, 7])), (b"DATA", 9, 4, 2, &shorts(&[0; 5])),
+            (b"DATA", 10, 4, 2, &shorts(&[0; 5]))]).contains("outside the trace"));
+        assert!(one(&[(b"PBAS", 2, 2, 1, b"AC"), (b"DATA", 9, 4, 2, &shorts(&[0; 5])), (b"DATA", 10, 4, 2, &shorts(&[0; 4]))]).contains("differ in length"));
+        let mut aliased = abif(&[(b"PBAS", 2, 2, 1, b"A"), (b"PCON", 2, 2, 1, &[0; 8])]);
+        let dir_at = i32::from_be_bytes(aliased[26..30].try_into().unwrap()) as usize;
+        aliased[dir_at + 28 + 12..dir_at + 28 + 16].copy_from_slice(&100_001i32.to_be_bytes()); // count far past the calls
+        assert!(parse(&aliased).is_err());
     }
 
     #[test]

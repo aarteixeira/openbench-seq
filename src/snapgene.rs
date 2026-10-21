@@ -66,7 +66,7 @@ pub fn parse(bytes: &[u8], max_len: usize) -> Result<Dna, String> {
     }
     let (seq, circular) = dna.ok_or("the file has no sequence")?;
     let (features, skipped) = match xml {
-        Some(x) => features(&String::from_utf8_lossy(x), seq.len())?,
+        Some(x) => features(&String::from_utf8_lossy(x), seq.len(), circular)?,
         None => (vec![], 0),
     };
     Ok(Dna { seq, circular, features, skipped })
@@ -98,7 +98,8 @@ fn unescape(s: &str) -> String {
     while let Some(i) = rest.find('&') {
         out.push_str(&rest[..i]);
         rest = &rest[i..];
-        let Some(semi) = rest.find(';').filter(|&j| j <= 10) else {
+        // Only a short window is searched, so a run of '&' costs linear time.
+        let Some(semi) = rest.bytes().take(12).position(|b| b == b';') else {
             out.push('&');
             rest = &rest[1..];
             continue;
@@ -129,14 +130,24 @@ fn unescape(s: &str) -> String {
     out
 }
 
-// 1-based inclusive "a-b" (or a single "a") to a 0-based [start, end), checked against the sequence length.
-fn range(r: &str, n: usize) -> Option<(usize, usize)> {
+// 1-based inclusive "a-b" (or a single "a") to a 0-based [start, end), checked against the sequence length. On a circle
+// a > b wraps the origin (end < start), and b = a - 1 is the whole circle, [0, n); on a linear sequence a > b is
+// invalid.
+fn range(r: &str, n: usize, circular: bool) -> Option<(usize, usize)> {
     let (a, b) = r.split_once('-').unwrap_or((r, r));
     let (a, b): (usize, usize) = (a.trim().parse().ok()?, b.trim().parse().ok()?);
-    (a >= 1 && b >= 1 && a <= n && b <= n).then_some((a - 1, b))
+    if a < 1 || b < 1 || a > n || b > n {
+        return None;
+    }
+    match (a <= b, circular) {
+        (true, _) => Some((a - 1, b)),
+        (false, false) => None,
+        (false, true) if b == a - 1 => Some((0, n)),
+        (false, true) => Some((a - 1, b)),
+    }
 }
 
-fn features(xml: &str, n: usize) -> Result<(Vec<Feature>, usize), String> {
+fn features(xml: &str, n: usize, circular: bool) -> Result<(Vec<Feature>, usize), String> {
     let mut out = Vec::new();
     let mut skipped = 0;
     let mut rest = xml;
@@ -146,27 +157,37 @@ fn features(xml: &str, n: usize) -> Result<(Vec<Feature>, usize), String> {
         let tag = &rest[..close];
         let body_end = if tag.ends_with('/') { 0 } else { rest.find("</Feature>").ok_or("an unterminated feature")? };
         let body = &rest[close..body_end.max(close)];
-        let mut segments = Vec::new();
+        // Every segment must lie on the sequence, or the feature is skipped (and counted) rather than shortened.
+        let mut segments: Vec<(usize, usize)> = Vec::new();
         let mut color = None;
+        let mut valid = true;
         let mut b = body;
         while let Some(j) = b.find("<Segment ") {
             b = &b[j + 9..];
             let end = b.find('>').ok_or("an unterminated segment tag")?;
             let seg = &b[..end];
-            if let Some(r) = attr(seg, "range").and_then(|r| range(&r, n)) {
-                segments.push(r);
-                if color.is_none() {
-                    color = attr(seg, "color").filter(|c| c.len() <= 32);
+            match attr(seg, "range").and_then(|r| range(&r, n, circular)) {
+                Some(r) => {
+                    // A segment that continues the previous one (also across the origin of a circle) extends it.
+                    match segments.last_mut() {
+                        Some(last) if last.1 == r.0 => last.1 = r.1,
+                        Some(last) if circular && last.1 == n && r.0 == 0 && r.1 < last.0 => last.1 = r.1,
+                        _ => segments.push(r),
+                    }
+                    if color.is_none() {
+                        color = attr(seg, "color").filter(|c| c.len() <= 32);
+                    }
                 }
+                None => valid = false,
             }
             b = &b[end..];
         }
         rest = &rest[body_end.max(close)..];
-        let (Some(&(start, _)), Some(&(_, end))) = (segments.first(), segments.last()) else {
+        if !valid || segments.is_empty() {
             skipped += 1;
             continue;
-        };
-        if out.len() == MAX_FEATURES {
+        }
+        if out.len() + segments.len() > MAX_FEATURES {
             return Err(format!("more than {MAX_FEATURES} features"));
         }
         let direction = match attr(tag, "directionality").as_deref() {
@@ -176,9 +197,12 @@ fn features(xml: &str, n: usize) -> Result<(Vec<Feature>, usize), String> {
         };
         let name: String = attr(tag, "name").unwrap_or_else(|| "feature".into()).chars().take(200).collect();
         let kind: String = attr(tag, "type").unwrap_or_else(|| "misc_feature".into()).chars().take(40).collect();
-        // A whole-circle feature ends where it starts; keep it as start..n rather than an empty wrap.
-        let end = if end == start { n } else { end };
-        out.push(Feature { name, kind, start, end, direction, color });
+        // Separate segments stay separate (one annotation each, numbered), so the gaps between them stay uncovered.
+        let parts = segments.len();
+        for (i, (start, end)) in segments.into_iter().enumerate() {
+            let name = if parts == 1 { name.clone() } else { format!("{name} (part {} of {parts})", i + 1) };
+            out.push(Feature { name, kind: kind.clone(), start, end, direction, color: color.clone() });
+        }
     }
     Ok((out, skipped))
 }
@@ -252,11 +276,39 @@ mod tests {
         assert_eq!(f, vec![
             ("lac & promoter", "promoter", 1, 5, 1),
             ("rev", "CDS", 8, 3, -1), // wraps the origin
-            ("split", "misc_feature", 0, 6, 0),
+            ("split (part 1 of 2)", "misc_feature", 0, 2, 0),
+            ("split (part 2 of 2)", "misc_feature", 3, 6, 0),
         ]);
         assert_eq!(d.features[0].color.as_deref(), Some("#ffffff"));
         assert_eq!(d.skipped, 1); // "outside" lies past the end
-        assert_eq!(to_json(&d).matches("\"name\"").count(), 3);
+        assert_eq!(to_json(&d).matches("\"name\"").count(), 4);
+    }
+
+    #[test]
+    fn coverage_is_kept_exactly() {
+        let feats = |xml: &str, flags: u8| {
+            let d = parse(&file(b"ACGTACGTAC", flags, xml), 100).unwrap();
+            (d.features.iter().map(|f| (f.name.clone(), f.start, f.end)).collect::<Vec<_>>(), d.skipped)
+        };
+        let one = |seg: &str| format!(r#"<Features><Feature name="f" type="misc_feature">{seg}</Feature></Features>"#);
+        // The whole circle written from base 9 covers all ten bases.
+        assert_eq!(feats(&one(r#"<Segment range="9-8"/>"#), 1), (vec![("f".into(), 0, 10)], 0));
+        // Contiguous segments join, also across the origin.
+        assert_eq!(feats(&one(r#"<Segment range="1-3"/><Segment range="4-6"/>"#), 1), (vec![("f".into(), 0, 6)], 0));
+        assert_eq!(feats(&one(r#"<Segment range="9-10"/><Segment range="1-2"/>"#), 1), (vec![("f".into(), 8, 2)], 0));
+        // One segment off the sequence skips the whole feature; a wrapping range on a linear sequence too.
+        assert_eq!(feats(&one(r#"<Segment range="1-2"/><Segment range="9-12"/>"#), 1), (vec![], 1));
+        assert_eq!(feats(&one(r#"<Segment range="9-2"/>"#), 0), (vec![], 1));
+    }
+
+    #[test]
+    fn a_run_of_ampersands_is_read_in_linear_time() {
+        let name = "&".repeat(1 << 20);
+        let xml = format!(r#"<Features><Feature name="{name}" type="misc_feature"><Segment range="1-2"/></Feature></Features>"#);
+        let t = std::time::Instant::now();
+        let d = parse(&file(b"ACGTACGTAC", 0, &xml), 100).unwrap();
+        assert_eq!(d.features[0].name.len(), 200);
+        assert!(t.elapsed().as_secs() < 2, "{:?}", t.elapsed());
     }
 
     #[test]

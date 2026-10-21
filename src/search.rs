@@ -16,7 +16,7 @@ pub struct Hit {
 }
 
 /// A protein residue `s` satisfies a query letter `q`: `X` in the query matches any residue; `B` matches D or N,
-/// `Z` E or Q, `J` I or L; an ambiguous letter in the sequence matches only the same letter.
+/// `Z` E or Q, `J` I or L; an ambiguous letter in the sequence matches only the same letter or a query `X`.
 fn residue(s: u8, q: u8) -> bool {
     let (s, q) = (s.to_ascii_uppercase(), q.to_ascii_uppercase());
     s == q
@@ -42,8 +42,10 @@ fn table(pattern: &[u8], ok: impl Fn(u8, u8) -> bool) -> Box<[u64; 256]> {
     t
 }
 
-// Windows of `text` (starting before `limit`) within k substitutions of the pattern behind `t`.
-fn scan(text: &[u8], limit: usize, m: usize, k: usize, t: &[u64; 256], strand: i8, out: &mut Vec<Hit>) {
+// Windows of `text` (starting before `limit`) within k substitutions of the pattern behind `t`, in position order:
+// all are counted, the first `keep` are kept. Returns the count.
+fn scan(text: &[u8], limit: usize, m: usize, k: usize, t: &[u64; 256], strand: i8, keep: usize, out: &mut Vec<Hit>) -> usize {
+    let mut count = 0;
     let mut r = [0u64; MAX_SUBSTITUTIONS + 1];
     let top = 1u64 << (m - 1);
     for (j, &c) in text.iter().enumerate() {
@@ -59,10 +61,14 @@ fn scan(text: &[u8], limit: usize, m: usize, k: usize, t: &[u64; 256], strand: i
                 break;
             }
             if let Some(d) = (0..=k).find(|&d| r[d] & top != 0) {
-                out.push(Hit { pos: start, strand, substitutions: d as u8 });
+                if count < keep {
+                    out.push(Hit { pos: start, strand, substitutions: d as u8 });
+                }
+                count += 1;
             }
         }
     }
+    count
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -77,6 +83,11 @@ pub enum SearchError {
 /// pattern is reported once, on the top strand); protein search covers the given strand only. On a circle, windows
 /// may cross the origin. Hits are ordered by position, then strand.
 pub fn search(seq: &[u8], pattern: &[u8], k: usize, protein: bool, circular: bool) -> Result<Vec<Hit>, SearchError> {
+    search_first(seq, pattern, k, protein, circular, usize::MAX).map(|(_, h)| h)
+}
+
+/// As `search`, but only the first `keep` hits (in that order) are held in memory; returns the total count with them.
+pub fn search_first(seq: &[u8], pattern: &[u8], k: usize, protein: bool, circular: bool, keep: usize) -> Result<(usize, Vec<Hit>), SearchError> {
     let m = pattern.len();
     if m == 0 {
         return Err(SearchError::EmptyPattern);
@@ -89,13 +100,13 @@ pub fn search(seq: &[u8], pattern: &[u8], k: usize, protein: bool, circular: boo
     }
     let n = seq.len();
     if n < m {
-        return Ok(vec![]);
+        return Ok((0, vec![]));
     }
     let text: Vec<u8> = if circular { [seq, &seq[..m - 1]].concat() } else { seq.to_vec() };
     let mut out = Vec::new();
     if protein {
-        scan(&text, n, m, k, &table(pattern, residue), 1, &mut out);
-        return Ok(out);
+        let total = scan(&text, n, m, k, &table(pattern, residue), 1, keep, &mut out);
+        return Ok((total, out));
     }
     let fwd: Vec<u8> = pattern.iter().map(|&b| mask(b)).collect();
     if fwd.contains(&0) {
@@ -103,12 +114,16 @@ pub fn search(seq: &[u8], pattern: &[u8], k: usize, protein: bool, circular: boo
     }
     let rev: Vec<u8> = fwd.iter().rev().map(|&q| complement(q)).collect();
     let by_mask = |pat: &[u8]| table(pat, |b, q| satisfies(mask(b), q));
-    scan(&text, n, m, k, &by_mask(&fwd), 1, &mut out);
+    let mut total = scan(&text, n, m, k, &by_mask(&fwd), 1, keep, &mut out);
     if rev != fwd {
-        scan(&text, n, m, k, &by_mask(&rev), -1, &mut out);
+        // Each strand's first `keep` hits contain the first `keep` of both together.
+        let mut bottom = Vec::new();
+        total += scan(&text, n, m, k, &by_mask(&rev), -1, keep, &mut bottom);
+        out.extend(bottom);
         out.sort_by_key(|h| (h.pos, -h.strand));
+        out.truncate(keep);
     }
-    Ok(out)
+    Ok((total, out))
 }
 
 #[cfg(test)]
@@ -164,9 +179,23 @@ mod tests {
         assert_eq!(hits("MKDNMR", "B", 0, true, false), vec![(2, 1, 0), (3, 1, 0)]);
         assert_eq!(hits("MKXR", "X", 0, true, false), vec![(0, 1, 0), (1, 1, 0), (2, 1, 0), (3, 1, 0)]);
         assert!(hits("MKDR", "Z", 0, true, false).is_empty());
+        // Query X matches every residue, ambiguous ones included; a sequence B, Z or J matches only itself (or X).
+        assert_eq!(hits("BZJ", "X", 0, true, false).len(), 3);
+        assert!(hits("BZJ", "D", 0, true, false).is_empty() && hits("BZJ", "E", 0, true, false).is_empty());
         // M and R keep their residue meaning (no nucleotide reading of R as A/G).
         assert_eq!(hits("AGRM", "R", 0, true, false), vec![(2, 1, 0)]);
         assert_eq!(hits("MKAAR", "MKXXK", 1, true, false), vec![(0, 1, 1)]);
+    }
+
+    #[test]
+    fn first_hits_and_the_total_without_holding_the_rest() {
+        let all = search(b"ACACACACAC", b"AC", 0, false, false).unwrap(); // AC on top, GT read as AC on the bottom: none
+        let (total, first) = search_first(b"ACACACACAC", b"AC", 0, false, false, 2).unwrap();
+        assert_eq!((total, first.as_slice()), (all.len(), &all[..2]));
+        // Both strands: the first three by position, then strand.
+        let both = search(b"GTACGTAC", b"AC", 0, false, false).unwrap();
+        let (t, f) = search_first(b"GTACGTAC", b"AC", 0, false, false, 3).unwrap();
+        assert_eq!((t, f.as_slice()), (both.len(), &both[..3]));
     }
 
     #[test]

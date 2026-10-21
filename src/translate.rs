@@ -88,29 +88,29 @@ fn strand_orfs(code: &[u8; 64], s: &[u8], circular: bool, min_aa: usize) -> Vec<
     // By stop position mod n: (start, aa). Sparse, so a long sequence costs memory per ORF, not per base.
     let mut best: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
     for frame in 0..3 {
-        let mut first_atg: Option<usize> = None;
+        // Starts since the last stop in this frame, oldest first; each expires on its own once more than a turn away.
+        let mut starts: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
         let mut i = frame;
         while i + 3 <= text.len() {
             let c = &text[i..i + 3];
-            let aa = codon(code, c);
-            if aa == b'*' {
-                if let Some(a) = first_atg.take() {
+            while starts.front().is_some_and(|&a| i + 3 - a > n) {
+                starts.pop_front();
+            }
+            if codon(code, c) == b'*' {
+                // The oldest start within one turn gives the longest ORF ending here; on a circle the stop may be on the
+                // second turn (its start then maps back to the first).
+                if let Some(&a) = starts.front() {
                     let len = (i - a) / 3;
-                    // A real ORF starts on the first turn and is shorter than the circle.
-                    if a < n && i + 3 - a <= n && len >= min_aa {
-                        let slot = best.entry(i % n).or_insert((a, len));
+                    if len >= min_aa {
+                        let slot = best.entry(i % n).or_insert((a % n, len));
                         if len > slot.1 {
-                            *slot = (a, len);
+                            *slot = (a % n, len);
                         }
                     }
                 }
-            } else if first_atg.is_none() && (c == b"ATG" || c == b"AUG") {
-                first_atg = Some(i);
-            } else if let Some(a) = first_atg {
-                // Longer than a whole turn: no stop on this circle in this frame; drop it.
-                if i + 3 - a > n {
-                    first_atg = None;
-                }
+                starts.clear();
+            } else if c == b"ATG" || c == b"AUG" {
+                starts.push_back(i);
             }
             i += 3;
         }
@@ -184,6 +184,61 @@ mod tests {
     #[test]
     fn rna_start_codon() {
         assert_eq!(orfs(std(), b"AUGAAAUAA", false, 1), vec![Orf { start: 0, end: 9, strand: 1, aa: 2 }]);
+    }
+
+    #[test]
+    fn a_later_start_survives_an_earlier_one_that_expires() {
+        // On this circle the ATG at 0 has no stop within a turn in its frame; the ATG at 9 reads ATG CAT GCC TAA
+        // across the origin.
+        assert_eq!(orfs(std(), b"ATGCCTAACATGC", true, 3), vec![Orf { start: 9, end: 8, strand: 1, aa: 3 }]);
+        assert_eq!(orfs(std(), &revcomp(b"ATGCCTAACATGC"), true, 3), vec![Orf { start: 5, end: 4, strand: -1, aa: 3 }]);
+        // From 6: ATG AAA TGA.
+        assert_eq!(orfs(std(), b"ATGAAAATGAA", true, 2), vec![Orf { start: 6, end: 4, strand: 1, aa: 2 }]);
+    }
+
+    // Independent reference: from every ATG on the circle, read codons for at most one turn to the first stop; for each
+    // stop keep the longest. Rotations of the circle must give the same ORFs, shifted.
+    fn brute(seq: &[u8], min_aa: usize) -> Vec<(usize, usize, usize)> {
+        let n = seq.len();
+        let at = |p: usize| seq[p % n];
+        let mut best: std::collections::BTreeMap<usize, (usize, usize)> = Default::default();
+        for s in 0..n {
+            if [at(s), at(s + 1), at(s + 2)] != *b"ATG" {
+                continue;
+            }
+            let mut k = 0;
+            while 3 * k + 3 <= n {
+                let c = [at(s + 3 * k), at(s + 3 * k + 1), at(s + 3 * k + 2)];
+                if codon(std(), &c) == b'*' {
+                    if k >= min_aa {
+                        let stop = (s + 3 * k) % n;
+                        if best.get(&stop).is_none_or(|&(_, l)| k > l) {
+                            best.insert(stop, (s, k));
+                        }
+                    }
+                    break;
+                }
+                k += 1;
+            }
+        }
+        let mut v: Vec<_> = best.into_iter().map(|(stop, (s, k))| (s, (stop + 3 - 1) % n + 1, k)).collect();
+        v.sort_unstable();
+        v
+    }
+
+    #[test]
+    fn circular_orfs_match_an_independent_scan() {
+        let mut x = 99u64;
+        for _ in 0..3000 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let n = 6 + (x >> 40) as usize % 40;
+            // A, T and G rich so ATG and stops are frequent.
+            let seq: Vec<u8> = (0..n).map(|i| b"ATGATGAC"[((x >> (i % 50)) as usize + i * 7) % 8]).collect();
+            for min in [1, 2] {
+                let got: Vec<_> = strand_orfs(std(), &seq, true, min);
+                assert_eq!(got, brute(&seq, min), "{}", String::from_utf8_lossy(&seq));
+            }
+        }
     }
 
     #[test]
