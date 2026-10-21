@@ -2,7 +2,7 @@
 //!
 //! Calling convention (no unsafe code on this side): the host asks `ob_input(slot, len)` for a buffer and writes its
 //! bytes there, then calls an operation. An operation returns a count, or a negative error code with a message in
-//! the byte output (`-1` invalid input, `-2` too large). Results are read from `ob_out_i32_ptr` (i32 values) or
+//! the byte output (`-1` invalid input; its length from `ob_out_bytes_len`). Results are read from `ob_out_i32_ptr` (i32 values) or
 //! `ob_out_bytes_ptr` (UTF-8 bytes) until the next call. The host re-reads memory views after every call, since any
 //! call may grow memory.
 //!
@@ -76,6 +76,13 @@ pub extern "C" fn ob_out_i32_ptr() -> u32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn ob_out_bytes_ptr() -> u32 {
     OUT_BYTES.with(|o| o.borrow().as_ptr() as usize as u32)
+}
+
+/// Length of the byte output: the result of the last byte operation, or the message of the last error.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn ob_out_bytes_len() -> u32 {
+    OUT_BYTES.with(|o| o.borrow().len() as u32)
 }
 
 /// Translate slot 0 with NCBI code `table`: the protein, as bytes.
@@ -190,6 +197,7 @@ mod tests {
     fn errors_carry_a_message() {
         put(0, b"ACGT");
         assert_eq!(ob_translate(99), -1);
+        assert_eq!(ob_out_bytes_len(), 23);
         assert_eq!(OUT_BYTES.with(|o| String::from_utf8(o.borrow().clone()).unwrap()), "unknown genetic code 99");
         put(0, b"ACGT");
         put(1, b"GAATTC\tx\t5\t");
