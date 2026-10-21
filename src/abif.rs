@@ -119,10 +119,10 @@ pub fn parse(f: &[u8]) -> Result<Trace, String> {
     if lengths.windows(2).any(|w| w[0] != w[1]) {
         return Err("the trace channels differ in length".into());
     }
-    if let (Some(&len), Some(&last)) = (lengths.first(), peaks.last()) {
-        if last as usize >= len {
-            return Err("a peak position lies outside the trace".into());
-        }
+    if let (Some(&len), Some(&last)) = (lengths.first(), peaks.last())
+        && last as usize >= len
+    {
+        return Err("a peak position lies outside the trace".into());
     }
     let name = find(b"SMPL", &[1])
         .and_then(|e| e.data.split_first().map(|(&l, rest)| String::from_utf8_lossy(&rest[..(l as usize).min(rest.len())]).into_owned()))
