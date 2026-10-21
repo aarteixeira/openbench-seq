@@ -106,15 +106,17 @@ pub extern "C" fn ob_orfs(circular: u32, min_aa: u32, table: u32) -> i32 {
     ints(orfs.iter().flat_map(|o| [o.start as i32, o.end as i32, o.strand as i32, o.aa as i32]).collect())
 }
 
-/// Search slot 0 for the pattern in slot 1: the total hit count, then (position, strand, substitutions) for the
-/// first `max_hits` hits.
+/// Search slot 0 for the pattern in slot 1: the total hit count, then `bins` counts of all hits over equal parts of
+/// the sequence, then (position, strand, substitutions) for the first `max_hits` hits.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ob_search(k: u32, protein: u32, circular: u32, max_hits: u32) -> i32 {
+pub extern "C" fn ob_search(k: u32, protein: u32, circular: u32, max_hits: u32, bins: u32) -> i32 {
     let (seq, pat) = (input(0), input(1));
-    match search::search_first(&seq, &pat, k as usize, protein != 0, circular != 0, max_hits as usize) {
+    let mut counts = vec![0u32; (bins as usize).min(1 << 16)];
+    match search::search_binned(&seq, &pat, k as usize, protein != 0, circular != 0, max_hits as usize, &mut counts) {
         Ok((total, h)) => {
             let mut out = vec![total.min(i32::MAX as usize) as i32];
+            out.extend(counts.iter().map(|&c| c.min(i32::MAX as u32) as i32));
             out.extend(h.iter().flat_map(|h| [h.pos as i32, h.strand as i32, h.substitutions as i32]));
             ints(out)
         }
@@ -185,8 +187,9 @@ mod tests {
         assert_eq!(OUT_BYTES.with(|o| o.borrow().clone()), b"MK*");
         put(0, b"AAGGATCCAA");
         put(1, b"GGATCC");
-        assert_eq!(ob_search(0, 0, 0, 10), 4);
-        assert_eq!(OUT_I32.with(|o| o.borrow().clone()), vec![1, 2, 1, 0]);
+        // Total 1, two bins of five bases (the hit at 2 in the first), then the hit.
+        assert_eq!(ob_search(0, 0, 0, 10, 2), 6);
+        assert_eq!(OUT_I32.with(|o| o.borrow().clone()), vec![1, 1, 0, 2, 1, 0]);
         put(0, b"AAGAATTCAA");
         put(1, b"GAATTC\t1\t5\t\nGATC\t0\t4\td");
         assert_eq!(ob_cuts(0), 3);

@@ -43,8 +43,10 @@ fn table(pattern: &[u8], ok: impl Fn(u8, u8) -> bool) -> Box<[u64; 256]> {
 }
 
 // Windows of `text` (starting before `limit`) within k substitutions of the pattern behind `t`, in position order:
-// all are counted, the first `keep` are kept. Returns the count and the kept hits.
-fn scan(text: &[u8], limit: usize, m: usize, k: usize, t: &[u64; 256], strand: i8, keep: usize) -> (usize, Vec<Hit>) {
+// all are counted (each also in `bins`, equal parts of [0, limit)), the first `keep` are kept. Returns the count and
+// the kept hits.
+#[allow(clippy::too_many_arguments)] // one call per strand; a struct would only rename them
+fn scan(text: &[u8], limit: usize, m: usize, k: usize, t: &[u64; 256], strand: i8, keep: usize, bins: &mut [u32]) -> (usize, Vec<Hit>) {
     let (mut count, mut out) = (0, Vec::new());
     let mut r = [0u64; MAX_SUBSTITUTIONS + 1];
     let top = 1u64 << (m - 1);
@@ -63,6 +65,10 @@ fn scan(text: &[u8], limit: usize, m: usize, k: usize, t: &[u64; 256], strand: i
             if let Some(d) = (0..=k).find(|&d| r[d] & top != 0) {
                 if count < keep {
                     out.push(Hit { pos: start, strand, substitutions: d as u8 });
+                }
+                if !bins.is_empty() {
+                    let b = (start as u64 * bins.len() as u64 / limit as u64) as usize;
+                    bins[b] = bins[b].saturating_add(1);
                 }
                 count += 1;
             }
@@ -88,6 +94,12 @@ pub fn search(seq: &[u8], pattern: &[u8], k: usize, protein: bool, circular: boo
 
 /// As `search`, but only the first `keep` hits (in that order) are held in memory; returns the total count with them.
 pub fn search_first(seq: &[u8], pattern: &[u8], k: usize, protein: bool, circular: bool, keep: usize) -> Result<(usize, Vec<Hit>), SearchError> {
+    search_binned(seq, pattern, k, protein, circular, keep, &mut [])
+}
+
+/// As `search_first`, also counting every hit (kept or not) into `bins`: bin b counts hits starting in
+/// [b * n / bins, (b + 1) * n / bins), so a map can show where all of them are.
+pub fn search_binned(seq: &[u8], pattern: &[u8], k: usize, protein: bool, circular: bool, keep: usize, bins: &mut [u32]) -> Result<(usize, Vec<Hit>), SearchError> {
     let m = pattern.len();
     if m == 0 {
         return Err(SearchError::EmptyPattern);
@@ -104,7 +116,7 @@ pub fn search_first(seq: &[u8], pattern: &[u8], k: usize, protein: bool, circula
     }
     let text: Vec<u8> = if circular { [seq, &seq[..m - 1]].concat() } else { seq.to_vec() };
     if protein {
-        return Ok(scan(&text, n, m, k, &table(pattern, residue), 1, keep));
+        return Ok(scan(&text, n, m, k, &table(pattern, residue), 1, keep, bins));
     }
     let fwd: Vec<u8> = pattern.iter().map(|&b| mask(b)).collect();
     if fwd.contains(&0) {
@@ -112,10 +124,10 @@ pub fn search_first(seq: &[u8], pattern: &[u8], k: usize, protein: bool, circula
     }
     let rev: Vec<u8> = fwd.iter().rev().map(|&q| complement(q)).collect();
     let by_mask = |pat: &[u8]| table(pat, |b, q| satisfies(mask(b), q));
-    let (mut total, mut out) = scan(&text, n, m, k, &by_mask(&fwd), 1, keep);
+    let (mut total, mut out) = scan(&text, n, m, k, &by_mask(&fwd), 1, keep, bins);
     if rev != fwd {
         // Each strand's first `keep` hits contain the first `keep` of both together.
-        let (count, bottom) = scan(&text, n, m, k, &by_mask(&rev), -1, keep);
+        let (count, bottom) = scan(&text, n, m, k, &by_mask(&rev), -1, keep, bins);
         total += count;
         out.extend(bottom);
         out.sort_by_key(|h| (h.pos, -h.strand));
@@ -194,6 +206,21 @@ mod tests {
         let both = search(b"GTACGTAC", b"AC", 0, false, false).unwrap();
         let (t, f) = search_first(b"GTACGTAC", b"AC", 0, false, false, 3).unwrap();
         assert_eq!((t, f.as_slice()), (both.len(), &both[..3]));
+    }
+
+    #[test]
+    fn bins_count_every_hit_including_those_not_kept() {
+        // 40 bases, "AC" at 0, 2, ..., 38 (20 hits, the bottom strand's GT none); 4 bins of 10 bases; keep 3.
+        let seq = "AC".repeat(20);
+        let mut bins = [0u32; 4];
+        let (total, kept) = search_binned(seq.as_bytes(), b"AC", 0, false, false, 3, &mut bins).unwrap();
+        assert_eq!((total, kept.len()), (20, 3));
+        assert_eq!(bins, [5, 5, 5, 5]);
+        // Both strands are counted: "GATT" on the top strand at 0, its reverse complement "AATC" at 8 and 16.
+        let mut bins = [0u32; 3];
+        let (total, _) = search_binned(b"GATTCCCCAATCCCCCAATC", b"GATT", 0, false, false, 0, &mut bins).unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(bins, [1, 1, 1]);
     }
 
     #[test]
