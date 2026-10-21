@@ -1,0 +1,187 @@
+//! Translation with NCBI genetic codes, and ATG-to-stop ORFs on both strands, across the origin of circles.
+
+use crate::alphabet::{mask, revcomp};
+
+/// NCBI translation tables (amino acids in TCAG codon order): 1 standard, 2 vertebrate mitochondrial,
+/// 4 mold/protozoan mitochondrial and Mycoplasma, 11 bacterial (same amino acids as 1).
+pub fn table(id: u32) -> Option<&'static [u8; 64]> {
+    match id {
+        1 | 11 => Some(b"FFLLSSSSYY**CC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG"),
+        2 => Some(b"FFLLSSSSYY**CCWWLLLLPPPPHHQQRRRRIIMMTTTTNNKKSS**VVVVAAAADDEEGGGG"),
+        4 => Some(b"FFLLSSSSYY**CCWWLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG"),
+        _ => None,
+    }
+}
+
+// Index of a base in TCAG order, by mask bit (A=1, C=2, G=4, T=8).
+const fn tcag(bit: u8) -> usize {
+    match bit {
+        8 => 0,
+        2 => 1,
+        1 => 2,
+        _ => 3,
+    }
+}
+
+/// One codon: the amino acid every reading of its ambiguity codes agrees on, else `X`.
+pub fn codon(code: &[u8; 64], c: &[u8]) -> u8 {
+    let [a, b, d] = [mask(c[0]), mask(c[1]), mask(c[2])];
+    if a == 0 || b == 0 || d == 0 {
+        return b'X';
+    }
+    let mut out = 0u8;
+    for x in [1u8, 2, 4, 8].into_iter().filter(|x| a & x != 0) {
+        for y in [1u8, 2, 4, 8].into_iter().filter(|y| b & y != 0) {
+            for z in [1u8, 2, 4, 8].into_iter().filter(|z| d & z != 0) {
+                let aa = code[16 * tcag(x) + 4 * tcag(y) + tcag(z)];
+                if out != 0 && out != aa {
+                    return b'X';
+                }
+                out = aa;
+            }
+        }
+    }
+    out
+}
+
+/// Translate whole codons from the start of `dna`; stops are `*`.
+pub fn translate(code: &[u8; 64], dna: &[u8]) -> Vec<u8> {
+    dna.chunks_exact(3).map(|c| codon(code, c)).collect()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Orf {
+    /// 0-based start on the top strand.
+    pub start: usize,
+    /// 0-based exclusive end on the top strand; `end < start` wraps the origin (circular only).
+    pub end: usize,
+    pub strand: i8,
+    /// Amino acids, the stop excluded.
+    pub aa: usize,
+}
+
+/// ATG..stop ORFs of at least `min_aa` amino acids (stop excluded) on both strands. On a circle an ORF may cross
+/// the origin; for each stop only the longest ORF (its most upstream in-frame ATG) is reported.
+pub fn orfs(code: &[u8; 64], seq: &[u8], circular: bool, min_aa: usize) -> Vec<Orf> {
+    let n = seq.len();
+    let mut out = Vec::new();
+    for strand in [1i8, -1] {
+        let s = if strand == 1 { seq.to_ascii_uppercase() } else { revcomp(seq) };
+        for o in strand_orfs(code, &s, circular, min_aa) {
+            // An ORF [a, e) on the reverse complement is [n - e, n - a) on the top strand (wrapping stays wrapping).
+            let (start, end) = if strand == 1 { (o.0, o.1) } else { ((n - o.1) % n, n - o.0) };
+            out.push(Orf { start, end, strand, aa: o.2 });
+        }
+    }
+    out.sort_by_key(|o| (o.start, o.strand));
+    out
+}
+
+// (start, end, amino acids) on one strand's text; end is in 1..=n, and end < start when the ORF wraps.
+fn strand_orfs(code: &[u8; 64], s: &[u8], circular: bool, min_aa: usize) -> Vec<(usize, usize, usize)> {
+    let n = s.len();
+    if n < 6 {
+        return vec![];
+    }
+    // A circle is scanned twice over, so every stop sees up to a whole turn of upstream context in its own frame.
+    let text: Vec<u8> = if circular { [s, s].concat() } else { s.to_vec() };
+    let mut best: Vec<Option<(usize, usize)>> = vec![None; n]; // by stop position mod n: (start, aa)
+    for frame in 0..3 {
+        let mut first_atg: Option<usize> = None;
+        let mut i = frame;
+        while i + 3 <= text.len() {
+            let c = &text[i..i + 3];
+            let aa = codon(code, c);
+            if aa == b'*' {
+                if let Some(a) = first_atg.take() {
+                    let len = (i - a) / 3;
+                    // A real ORF starts on the first turn and is shorter than the circle.
+                    if a < n && i + 3 - a <= n && len >= min_aa {
+                        let slot = &mut best[i % n];
+                        if slot.is_none_or(|(_, l)| len > l) {
+                            *slot = Some((a, len));
+                        }
+                    }
+                }
+            } else if first_atg.is_none() && c == b"ATG" {
+                first_atg = Some(i);
+            } else if let Some(a) = first_atg {
+                // Longer than a whole turn: no stop on this circle in this frame; drop it.
+                if i + 3 - a > n {
+                    first_atg = None;
+                }
+            }
+            i += 3;
+        }
+    }
+    best.iter()
+        .enumerate()
+        .filter_map(|(stop, b)| {
+            b.map(|(a, len)| {
+                let e = stop + 3;
+                (a, if e > n { e - n } else { e }, len)
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn std() -> &'static [u8; 64] {
+        table(1).unwrap()
+    }
+
+    #[test]
+    fn standard_and_mitochondrial_codes() {
+        assert_eq!(translate(std(), b"ATGTGAAGAATATAA"), b"M*RI*".to_vec());
+        assert_eq!(translate(table(2).unwrap(), b"ATGTGAAGAATATAA"), b"MW*M*".to_vec());
+        assert_eq!(translate(table(4).unwrap(), b"TGA"), b"W".to_vec());
+        assert!(table(3).is_none());
+    }
+
+    #[test]
+    fn ambiguity_translates_only_when_unanimous() {
+        // GCN is always Ala; YTR is Leu (CTA CTG TTA TTG); RAY is Asn or Asp.
+        assert_eq!(translate(std(), b"GCNYTRRAYNNN"), b"ALXX".to_vec());
+        assert_eq!(translate(std(), b"ATGC"), b"M".to_vec()); // a trailing partial codon is ignored
+    }
+
+    #[test]
+    fn linear_orfs_take_the_first_atg_per_stop() {
+        // ATG AAA ATG CCC TAA: one ORF of 4 aa from the first ATG.
+        let o = orfs(std(), b"ATGAAAATGCCCTAA", false, 1);
+        assert_eq!(o, vec![Orf { start: 0, end: 15, strand: 1, aa: 4 }]);
+        assert!(orfs(std(), b"ATGAAAATGCCCTAA", false, 5).is_empty());
+    }
+
+    #[test]
+    fn reverse_strand_coordinates() {
+        // Reverse complement of ATGAAATAG is CTATTTCAT; padded so the ORF sits at 3..12.
+        let o = orfs(std(), b"GGGCTATTTCATGGG", false, 2);
+        assert_eq!(o, vec![Orf { start: 3, end: 12, strand: -1, aa: 2 }]);
+    }
+
+    #[test]
+    fn circular_orf_across_the_origin() {
+        // Circle "AAATAGCC" + "CCATGAAA": ATG at 10 reads ATG AAA AAA TAG across the origin, stop ending at 6.
+        let seq = b"AAATAGCCCCATGAAA";
+        let o = orfs(std(), seq, true, 3);
+        assert_eq!(o, vec![Orf { start: 10, end: 6, strand: 1, aa: 3 }]);
+        assert!(orfs(std(), seq, false, 3).is_empty()); // linear: no stop after the ATG
+    }
+
+    #[test]
+    fn circular_reverse_orf_across_the_origin() {
+        // Reverse complement of the circle above: the same ORF on the minus strand, wrapping the origin.
+        let seq = revcomp(b"AAATAGCCCCATGAAA"); // TTTCATGGGGCTATTT
+        let o = orfs(std(), &seq, true, 3);
+        assert_eq!(o, vec![Orf { start: 10, end: 6, strand: -1, aa: 3 }]);
+    }
+
+    #[test]
+    fn circle_without_stop_has_no_orf() {
+        assert!(orfs(std(), b"ATGAAAAAAAAA", true, 1).is_empty());
+    }
+}
