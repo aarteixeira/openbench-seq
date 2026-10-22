@@ -98,15 +98,19 @@ pub fn parse(bytes: &[u8], max_len: usize) -> Result<Dna, String> {
 fn xml_text<'a>(x: &'a [u8], what: &str) -> Result<&'a str, String> {
     let s = std::str::from_utf8(x).map_err(|_| format!("the {what} is not UTF-8 text"))?;
     let refused = || format!("the {what} holds XML this reader does not read (a comment or similar); save the file again in SnapGene, or export it as GenBank");
+    // The declaration ends at its own `?>`, with no `<` before it: an unfinished one never borrows a later `?>`. The
+    // element readers get only the checked text after it.
     let body = match s.trim_start_matches('\u{feff}').trim_start().strip_prefix("<?xml") {
-        // An unfinished declaration is refused too: the text after it is never let through unchecked.
-        Some(d) if d.starts_with(char::is_whitespace) => &d[d.find("?>").ok_or_else(refused)? + 2..],
+        Some(d) if d.starts_with(char::is_whitespace) => {
+            let end = d.find(['<', '>']).filter(|&e| d[..e].ends_with('?') && d.as_bytes()[e] == b'>').ok_or_else(refused)?;
+            &d[end + 1..]
+        }
         _ => s,
     };
     if body.contains("<!") || body.contains("<?") {
         return Err(refused());
     }
-    Ok(s)
+    Ok(body)
 }
 
 /// An element's name as messages say it.
@@ -680,7 +684,9 @@ mod tests {
                     r#"<Primers><Primer name="p"><![CDATA[<BindingSite location="0-2" boundStrand="1"/>]]></Primer></Primers>"#,
                     r#"<?xml version="1.0"?><Primers><Primer name="p"><?x <BindingSite location="0-2" boundStrand="1"/> ?></Primer></Primers>"#,
                     // A declaration never finished does not hide what follows it.
-                    r#"<?xml version="1.0"<Primers><Primer name="p"><!-- <BindingSite location="0-2" boundStrand="1"/> --></Primer></Primers>"#] {
+                    r#"<?xml version="1.0"<Primers><Primer name="p"><!-- <BindingSite location="0-2" boundStrand="1"/> --></Primer></Primers>"#,
+                    r#"<?xml version="1.0"
+<Primers><Primer name="p"><!-- <BindingSite location="0-2" boundStrand="1"/> --></Primer></Primers><?other?>"#] {
             assert_eq!(with(xml).unwrap_err(), "the primer list holds XML this reader does not read (a comment or similar); save the file again in SnapGene, or export it as GenBank");
         }
         // The declaration SnapGene writes, after a byte order mark, is read.
