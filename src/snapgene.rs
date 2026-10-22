@@ -5,7 +5,13 @@
 
 use crate::json;
 
-pub const MAX_FEATURES: usize = 10_000;
+/// The most features (parts and primer sites included) a file brings; more is refused while reading, so a file of tiny
+/// features cannot build millions of them. OpenBench's text readers use the same limit (src/lib/seq.ts MAX_FEATURES).
+pub const MAX_FEATURES: usize = 100_000;
+
+fn too_many() -> String {
+    format!("the file has more than {MAX_FEATURES} features; at most {MAX_FEATURES} are imported")
+}
 
 #[derive(Debug, PartialEq)]
 pub struct Feature {
@@ -73,10 +79,7 @@ pub fn parse(bytes: &[u8], max_len: usize) -> Result<Dna, String> {
         None => (vec![], 0),
     };
     if let Some(x) = primer_xml {
-        let found = primers(&String::from_utf8_lossy(x), seq.len(), circular);
-        if features.len() + found.len() > MAX_FEATURES {
-            return Err(format!("more than {MAX_FEATURES} features"));
-        }
+        let found = primers(&String::from_utf8_lossy(x), seq.len(), circular, MAX_FEATURES - features.len())?;
         features.extend(found);
     }
     Ok(Dna { seq, circular, features, skipped })
@@ -192,7 +195,12 @@ fn features(xml: &str, n: usize, circular: bool) -> Result<(Vec<Feature>, usize)
                         Some(last) if last.1 == r.0 || (circular && last.1 == n && r.0 == 0) => {
                             *last = if last.2 + len >= n { (0, n, n) } else { (last.0, r.1, last.2 + len) };
                         }
-                        _ => segments.push((r.0, r.1, len)),
+                        _ => {
+                            if out.len() + segments.len() >= MAX_FEATURES {
+                                return Err(too_many());
+                            }
+                            segments.push((r.0, r.1, len))
+                        }
                     }
                     if color.is_none() {
                         color = attr(seg, "color").filter(|c| c.len() <= 32);
@@ -206,9 +214,6 @@ fn features(xml: &str, n: usize, circular: bool) -> Result<(Vec<Feature>, usize)
         if !valid || segments.is_empty() {
             skipped += 1;
             continue;
-        }
-        if out.len() + segments.len() > MAX_FEATURES {
-            return Err(format!("more than {MAX_FEATURES} features"));
         }
         let direction = match attr(tag, "directionality").as_deref() {
             Some("1") => 1,
@@ -233,7 +238,7 @@ fn features(xml: &str, n: usize, circular: bool) -> Result<(Vec<Feature>, usize)
 // temperature fall short of the file's hybridization parameters is not shown, nor a "simplified" site repeating one
 // already listed. Binding-site locations are 0-based and inclusive ("751-775" is [751, 776)), unlike segments; a
 // site bound to the bottom strand (boundStrand 1) is a reverse primer. A site outside the sequence is left out.
-fn primers(xml: &str, n: usize, circular: bool) -> Vec<Feature> {
+fn primers(xml: &str, n: usize, circular: bool, room: usize) -> Result<Vec<Feature>, String> {
     let num = |s: Option<String>| s.and_then(|v| v.trim().parse::<i64>().ok());
     let (mut min_len, mut min_tm) = (0, 0);
     if let Some(i) = xml.find("<HybridizationParams") {
@@ -275,12 +280,15 @@ fn primers(xml: &str, n: usize, circular: bool) -> Vec<Feature> {
             {
                 continue;
             }
+            if out.len() == room {
+                return Err(too_many());
+            }
             seen.push((start, end, direction));
             out.push(Feature { name: name.clone(), kind: "primer_bind".into(), start, end, direction, color: None });
         }
         rest = &rest[body_end.max(close)..];
     }
-    out
+    Ok(out)
 }
 
 pub fn to_json(d: &Dna) -> String {
@@ -486,5 +494,21 @@ mod tests {
         // [2, 6) forward once (the simplified repeat dropped); [8, 2) across the origin, reverse; the short, cold and
         // out-of-range sites left out.
         assert_eq!(got, [("primer_bind", 2, 6, 1), ("primer_bind", 8, 2, -1)]);
+    }
+
+    #[test]
+    fn features_parts_and_primer_sites_stop_at_the_limit() {
+        let seg = r#"<Segment range="1-2"/>"#;
+        // MAX_FEATURES one-part features are read; one more feature, or one more part, is refused.
+        let feats = |k: usize, parts: usize| format!("<Features>{}</Features>", format!(r#"<Feature name="f" type="misc_feature">{}</Feature>"#,
+            [seg, r#"<Segment range="4-5"/>"#][..parts].concat()).repeat(k));
+        assert_eq!(parse(&file(b"ACGTACGTAC", 0, &feats(MAX_FEATURES, 1)), 100).unwrap().features.len(), MAX_FEATURES);
+        assert_eq!(parse(&file(b"ACGTACGTAC", 0, &feats(MAX_FEATURES + 1, 1)), 100).unwrap_err(), too_many());
+        assert_eq!(parse(&file(b"ACGTACGTAC", 0, &feats(MAX_FEATURES / 2 + 1, 2)), 100).unwrap_err(), too_many());
+        // Primer sites count with the features.
+        let site = r#"<Primer name="p"><BindingSite location="1-3" boundStrand="0"/></Primer>"#;
+        let with_primers = |k: usize| { let mut f = file(b"ACGTACGTAC", 0, &feats(MAX_FEATURES - 1, 1)); f.extend(packet(0x05, format!("<Primers>{}</Primers>", site.repeat(k)).as_bytes())); f };
+        assert_eq!(parse(&with_primers(1), 100).unwrap().features.len(), MAX_FEATURES);
+        assert_eq!(parse(&with_primers(2), 100).unwrap_err(), too_many());
     }
 }
