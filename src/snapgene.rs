@@ -94,7 +94,11 @@ pub fn parse(bytes: &[u8], max_len: usize) -> Result<Dna, String> {
 
 /// An element's name as messages say it.
 fn label(name: &str) -> String {
-    if name == "BindingSite" { "binding site".into() } else { name.to_lowercase() }
+    match name {
+        "BindingSite" => "binding site".into(),
+        "HybridizationParams" => "hybridization parameters".into(),
+        _ => name.to_lowercase(),
+    }
 }
 
 /// The next `<name` element in `s`: the index just past `<name` (its tag text follows), or none. `<names` is another
@@ -113,49 +117,65 @@ fn next_open(s: &str, name: &str) -> Result<Option<usize>, String> {
     Ok(None)
 }
 
-/// The tag text of the element whose `<name` ends at the start of `s` (up to its `>`), checked as XML writes it:
-/// attributes `key="value"` or `key='value'`, then an optional `/`. A `<`, an unquoted, unclosed or valueless attribute
-/// is a damaged tag, refused: a later tag's `>` is never borrowed and a damaged value never read as absent.
-fn tag_of<'a>(s: &'a str, name: &str) -> Result<(&'a str, usize), String> {
+/// A tag's attributes, read as XML writes them, and whether it closes itself (`/>`).
+struct Tag {
+    attrs: Vec<(String, String)>,
+    closed: bool,
+}
+
+impl Tag {
+    /// The value of attribute `name`, unescaped; none when the tag has no such attribute.
+    fn get(&self, name: &str) -> Option<String> {
+        self.attrs.iter().find(|(k, _)| k == name).map(|(_, v)| unescape(v))
+    }
+    /// A whole number, none when absent; a value present but not a number is a damaged file, never read as absent.
+    fn num(&self, name: &str, what: &str) -> Result<Option<i64>, String> {
+        self.get(name).map(|v| v.trim().parse().map_err(|_| format!("{what} is not a number"))).transpose()
+    }
+}
+
+/// The tag of the element whose `<name` ends at the start of `s`, and the index of its closing `>`. Read in one pass:
+/// attributes `key="value"` or `key='value'` (a value is opaque: a `>` or another key inside it is text, a `<` is not
+/// allowed), each key once, then an optional `/` and the `>`. Anything else is a damaged tag, refused: a later tag's
+/// `>` is never borrowed and a damaged value never read as absent.
+fn tag_of(s: &str, name: &str) -> Result<(Tag, usize), String> {
     let damaged = || format!("a damaged {} tag", label(name));
-    let close = s.find('>').ok_or_else(|| format!("an unterminated {} tag", label(name)))?;
-    let tag = &s[..close];
-    let mut t = tag.trim_start();
-    while !t.is_empty() && t != "/" {
+    let unterminated = || format!("an unterminated {} tag", label(name));
+    let mut attrs: Vec<(String, String)> = Vec::new();
+    let mut keys = std::collections::HashSet::new();
+    let mut i = 0;
+    loop {
+        let skipped = s[i..].len() - s[i..].trim_start().len();
+        i += skipped;
+        match s[i..].chars().next() {
+            None => return Err(unterminated()),
+            Some('>') => return Ok((Tag { attrs, closed: false }, i)),
+            Some('/') => {
+                return match s[i + 1..].chars().next() {
+                    Some('>') => Ok((Tag { attrs, closed: true }, i + 1)),
+                    None => Err(unterminated()),
+                    _ => Err(damaged()),
+                }
+            }
+            // An attribute starts only after whitespace (or the tag name).
+            Some(_) if skipped == 0 && !attrs.is_empty() => return Err(damaged()),
+            Some(_) => {}
+        }
+        let t = &s[i..];
         let key = t.find(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '-' | ':' | '.'))).unwrap_or(t.len());
-        if key == 0 {
+        if key == 0 || !keys.insert(&t[..key]) {
             return Err(damaged());
         }
         let v = t[key..].trim_start().strip_prefix('=').ok_or_else(damaged)?.trim_start();
         let q = v.chars().next().filter(|c| *c == '"' || *c == '\'').ok_or_else(damaged)?;
         let end = v[1..].find(q).ok_or_else(damaged)?;
-        let after = &v[1 + end + 1..];
-        if !(after.is_empty() || after.starts_with(char::is_whitespace) || after == "/") {
+        let value = &v[1..1 + end];
+        if value.contains('<') {
             return Err(damaged());
         }
-        t = after.trim_start();
+        attrs.push((t[..key].to_string(), value.to_string()));
+        i = s.len() - v[1 + end + 1..].len();
     }
-    Ok((tag, close))
-}
-
-// Attribute `name` of the tag text starting after `<Tag`.
-fn attr(tag: &str, name: &str) -> Option<String> {
-    let mut rest = tag;
-    while let Some(i) = rest.find(name) {
-        let before_ok = i == 0 || rest[..i].ends_with(|c: char| c.is_whitespace());
-        let after = rest[i + name.len()..].trim_start();
-        if before_ok && after.starts_with('=') {
-            let v = after[1..].trim_start();
-            let q = v.chars().next()?;
-            if q == '"' || q == '\'' {
-                let end = v[1..].find(q)?;
-                return Some(unescape(&v[1..1 + end]));
-            }
-            return None;
-        }
-        rest = &rest[i + name.len()..];
-    }
-    None
 }
 
 fn unescape(s: &str) -> String {
@@ -231,7 +251,7 @@ fn features(xml: &str, n: usize, circular: bool, cut: &mut usize) -> Result<(Vec
     while let Some(i) = next_open(rest, "Feature")? {
         rest = &rest[i..];
         let (tag, close) = tag_of(rest, "Feature")?;
-        let body_end = if tag.ends_with('/') { 0 } else { rest.find("</Feature>").ok_or("an unterminated feature")? };
+        let body_end = if tag.closed { 0 } else { rest.find("</Feature>").ok_or("an unterminated feature")? };
         // A feature's end is its own: one found past the next feature's start means this one was never closed.
         if body_end > close && next_open(&rest[close..body_end], "Feature")?.is_some() {
             return Err("an unterminated feature".into());
@@ -247,11 +267,11 @@ fn features(xml: &str, n: usize, circular: bool, cut: &mut usize) -> Result<(Vec
             b = &b[j..];
             let (seg, end) = tag_of(b, "Segment")?;
             // A gap segment marks the stretch between two parts: not covered by the feature.
-            if attr(seg, "type").as_deref() == Some("gap") {
+            if seg.get("type").as_deref() == Some("gap") {
                 b = &b[end..];
                 continue;
             }
-            match attr(seg, "range").and_then(|r| range(&r, n, circular)) {
+            match seg.get("range").and_then(|r| range(&r, n, circular)) {
                 Some(r) => {
                     let len = if r.1 > r.0 { r.1 - r.0 } else { n - r.0 + r.1 };
                     // A segment that continues the previous one (also across the origin of a circle) extends it; a
@@ -269,7 +289,7 @@ fn features(xml: &str, n: usize, circular: bool, cut: &mut usize) -> Result<(Vec
                         }
                     }
                     if color.is_none() {
-                        color = attr(seg, "color").filter(|c| c.len() <= 32);
+                        color = seg.get("color").filter(|c| c.len() <= 32);
                     }
                 }
                 None => valid = false,
@@ -281,13 +301,13 @@ fn features(xml: &str, n: usize, circular: bool, cut: &mut usize) -> Result<(Vec
             skipped += 1;
             continue;
         }
-        let direction = match attr(tag, "directionality").as_deref() {
+        let direction = match tag.get("directionality").as_deref() {
             Some("1") => 1,
             Some("2") => -1,
             _ => 0,
         };
-        let name = bounded(attr(tag, "name").unwrap_or_else(|| "feature".into()), 200, cut);
-        let kind = bounded(attr(tag, "type").unwrap_or_else(|| "misc_feature".into()), 40, cut);
+        let name = bounded(tag.get("name").unwrap_or_else(|| "feature".into()), 200, cut);
+        let kind = bounded(tag.get("type").unwrap_or_else(|| "misc_feature".into()), 40, cut);
         // A piece round the whole circle is [0, n), except a CDS's that starts elsewhere: its reading starts there, so it
         // stays two parts, from its start to the end and from the origin back to its start (as the GenBank reader keeps it).
         let mut segments: Vec<(usize, usize, usize)> = segments
@@ -322,12 +342,11 @@ fn features(xml: &str, n: usize, circular: bool, cut: &mut usize) -> Result<(Vec
 // already listed. Binding-site locations are 0-based and inclusive ("751-775" is [751, 776)), unlike segments; a
 // site bound to the bottom strand (boundStrand 1) is a reverse primer. A site outside the sequence is left out.
 fn primers(xml: &str, n: usize, circular: bool, room: usize, cut: &mut usize) -> Result<(Vec<Feature>, usize), String> {
-    let num = |s: Option<String>| s.and_then(|v| v.trim().parse::<i64>().ok());
     let (mut min_len, mut min_tm) = (0, 0);
-    if let Some(i) = xml.find("<HybridizationParams") {
-        let tag = &xml[i + 20..xml[i..].find('>').map_or(xml.len(), |e| i + e)];
-        min_len = num(attr(tag, "minContinuousMatchLen")).unwrap_or(0);
-        min_tm = num(attr(tag, "minMeltingTemperature")).unwrap_or(0);
+    if let Some(i) = next_open(xml, "HybridizationParams")? {
+        let (tag, _) = tag_of(&xml[i..], "HybridizationParams")?;
+        min_len = tag.num("minContinuousMatchLen", "a minimum match length")?.unwrap_or(0);
+        min_tm = tag.num("minMeltingTemperature", "a minimum melting temperature")?.unwrap_or(0);
     }
     let mut out = Vec::new();
     let mut skipped = 0;
@@ -336,12 +355,12 @@ fn primers(xml: &str, n: usize, circular: bool, room: usize, cut: &mut usize) ->
     while let Some(i) = next_open(rest, "Primer")? {
         rest = &rest[i..];
         let (tag, close) = tag_of(rest, "Primer")?;
-        let body_end = if tag.ends_with('/') { close } else { rest.find("</Primer>").ok_or("an unterminated primer")? };
+        let body_end = if tag.closed { close } else { rest.find("</Primer>").ok_or("an unterminated primer")? };
         if next_open(&rest[close..body_end], "Primer")?.is_some() {
             return Err("an unterminated primer".into());
         }
         let body = &rest[close..body_end.max(close)];
-        let name = bounded(attr(tag, "name").unwrap_or_else(|| "primer".into()), 200, cut);
+        let name = bounded(tag.get("name").unwrap_or_else(|| "primer".into()), 200, cut);
         // Sites listed so far, looked up in constant time: a primer with many sites stays linear.
         let mut seen: std::collections::HashSet<(usize, usize, i8)> = std::collections::HashSet::new();
         let mut b = body;
@@ -350,7 +369,7 @@ fn primers(xml: &str, n: usize, circular: bool, room: usize, cut: &mut usize) ->
             let (site, end) = tag_of(b, "BindingSite")?;
             b = &b[end..];
             // A site whose location is not on the sequence is left out and counted, as a feature's is.
-            let Some((s0, s1)) = attr(site, "location").and_then(|l| {
+            let Some((s0, s1)) = site.get("location").and_then(|l| {
                 let (a, z) = l.split_once('-')?;
                 Some((a.trim().parse::<usize>().ok()?, z.trim().parse::<usize>().ok()?))
             }) else {
@@ -363,16 +382,16 @@ fn primers(xml: &str, n: usize, circular: bool, room: usize, cut: &mut usize) ->
             }
             // Across the origin of a circle when s0 > s1; one base short of a full turn reads as the whole circle.
             let (start, end) = if s0 <= s1 || s1 + 1 != s0 { (s0, s1 + 1) } else { (0, n) };
-            let direction = match attr(site, "boundStrand").as_deref() {
+            let direction = match site.get("boundStrand").as_deref() {
                 Some("1") => -1,
                 None | Some("0") => 1,
                 Some(_) => return Err("a binding site's strand is neither 0 nor 1".into()),
             };
-            if attr(site, "simplified").as_deref() == Some("1") && seen.contains(&(start, end, direction)) {
+            if site.get("simplified").as_deref() == Some("1") && seen.contains(&(start, end, direction)) {
                 continue;
             }
-            if attr(site, "annealedBases").is_some_and(|a| (a.len() as i64) < min_len)
-                || num(attr(site, "meltingTemperature")).is_some_and(|t| t < min_tm)
+            if site.get("annealedBases").is_some_and(|a| (a.len() as i64) < min_len)
+                || site.num("meltingTemperature", "a binding site's melting temperature")?.is_some_and(|t| t < min_tm)
             {
                 continue;
             }
@@ -612,6 +631,22 @@ mod tests {
         assert_eq!(with(r#"<Primers><Primer name="p""#).unwrap_err(), "an unterminated primer tag");
         assert_eq!(with(r#"<Primers><Primer name="p"><BindingSite location="1-2" boundStrand="banana"/></Primer></Primers>"#).unwrap_err(),
             "a binding site's strand is neither 0 nor 1");
+        // Values are opaque: a key or a `>` inside one is text, never an attribute or the tag's end.
+        let one = |xml: &str| with(xml).map(|d| d.features.iter().map(|f| (f.name.clone(), f.start, f.end, f.direction)).collect::<Vec<_>>());
+        assert_eq!(one(r#"<Primers><Primer name="c.35G>A"><BindingSite location="1-4" note=" boundStrand='1'" boundStrand="0"/></Primer></Primers>"#).unwrap(),
+            [("c.35G>A".to_string(), 1, 5, 1)]);
+        for (xml, why) in [
+            (r#"<Primers><Primer name="p"><BindingSite location="1-4" boundStrand="0" boundStrand="1"/></Primer></Primers>"#, "a damaged binding site tag"),
+            (r#"<Primers><Primer name="p"><BindingSite location="1-4"boundStrand="1"/></Primer></Primers>"#, "a damaged binding site tag"),
+            (r#"<Primers><Primer name="a<b"><BindingSite location="1-4"/></Primer></Primers>"#, "a damaged primer tag"),
+            // A filter value that is present but not a number is refused, never read as no filter.
+            (r#"<Primers><HybridizationParams minMeltingTemperature="banana"/><Primer name="p"><BindingSite location="1-4"/></Primer></Primers>"#, "a minimum melting temperature is not a number"),
+            (r#"<Primers><HybridizationParams minContinuousMatchLen="banana"/><Primer name="p"><BindingSite location="1-4"/></Primer></Primers>"#, "a minimum match length is not a number"),
+            (r#"<Primers><HybridizationParams minMeltingTemperature=40/><Primer name="p"><BindingSite location="1-4"/></Primer></Primers>"#, "a damaged hybridization parameters tag"),
+            (r#"<Primers><HybridizationParams minMeltingTemperature="50"/><Primer name="p"><BindingSite location="1-4" meltingTemperature="banana"/></Primer></Primers>"#, "a binding site's melting temperature is not a number"),
+        ] {
+            assert_eq!(with(xml).unwrap_err(), why, "{xml}");
+        }
         // A later tag's delimiter is never borrowed, and a malformed attribute is never read as absent.
         for (xml, why) in [
             (r#"<Primers><Primer name="p"><BindingSite location="1-2"<BindingSite location="2-3"/></Primer></Primers>"#, "a damaged binding site tag"),
