@@ -92,6 +92,52 @@ pub fn parse(bytes: &[u8], max_len: usize) -> Result<Dna, String> {
     Ok(Dna { seq, circular, features, skipped, cut })
 }
 
+/// An element's name as messages say it.
+fn label(name: &str) -> String {
+    if name == "BindingSite" { "binding site".into() } else { name.to_lowercase() }
+}
+
+/// The next `<name` element in `s`: the index just past `<name` (its tag text follows), or none. `<names` is another
+/// element; `<name` at the very end of the text is an unfinished one, refused.
+fn next_open(s: &str, name: &str) -> Result<Option<usize>, String> {
+    let open = format!("<{name}");
+    let mut from = 0;
+    while let Some(i) = s[from..].find(&open) {
+        let at = from + i + open.len();
+        match s[at..].chars().next() {
+            None => return Err(format!("an unterminated {} tag", label(name))),
+            Some(c) if c.is_whitespace() || c == '>' || c == '/' => return Ok(Some(at)),
+            _ => from = at,
+        }
+    }
+    Ok(None)
+}
+
+/// The tag text of the element whose `<name` ends at the start of `s` (up to its `>`), checked as XML writes it:
+/// attributes `key="value"` or `key='value'`, then an optional `/`. A `<`, an unquoted, unclosed or valueless attribute
+/// is a damaged tag, refused: a later tag's `>` is never borrowed and a damaged value never read as absent.
+fn tag_of<'a>(s: &'a str, name: &str) -> Result<(&'a str, usize), String> {
+    let damaged = || format!("a damaged {} tag", label(name));
+    let close = s.find('>').ok_or_else(|| format!("an unterminated {} tag", label(name)))?;
+    let tag = &s[..close];
+    let mut t = tag.trim_start();
+    while !t.is_empty() && t != "/" {
+        let key = t.find(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '-' | ':' | '.'))).unwrap_or(t.len());
+        if key == 0 {
+            return Err(damaged());
+        }
+        let v = t[key..].trim_start().strip_prefix('=').ok_or_else(damaged)?.trim_start();
+        let q = v.chars().next().filter(|c| *c == '"' || *c == '\'').ok_or_else(damaged)?;
+        let end = v[1..].find(q).ok_or_else(damaged)?;
+        let after = &v[1 + end + 1..];
+        if !(after.is_empty() || after.starts_with(char::is_whitespace) || after == "/") {
+            return Err(damaged());
+        }
+        t = after.trim_start();
+    }
+    Ok((tag, close))
+}
+
 // Attribute `name` of the tag text starting after `<Tag`.
 fn attr(tag: &str, name: &str) -> Option<String> {
     let mut rest = tag;
@@ -182,11 +228,14 @@ fn features(xml: &str, n: usize, circular: bool, cut: &mut usize) -> Result<(Vec
     let mut out = Vec::new();
     let mut skipped = 0;
     let mut rest = xml;
-    while let Some(i) = rest.find("<Feature ") {
-        rest = &rest[i + 9..];
-        let close = rest.find('>').ok_or("an unterminated feature tag")?;
-        let tag = &rest[..close];
+    while let Some(i) = next_open(rest, "Feature")? {
+        rest = &rest[i..];
+        let (tag, close) = tag_of(rest, "Feature")?;
         let body_end = if tag.ends_with('/') { 0 } else { rest.find("</Feature>").ok_or("an unterminated feature")? };
+        // A feature's end is its own: one found past the next feature's start means this one was never closed.
+        if body_end > close && next_open(&rest[close..body_end], "Feature")?.is_some() {
+            return Err("an unterminated feature".into());
+        }
         let body = &rest[close..body_end.max(close)];
         // Every segment must lie on the sequence, or the feature is skipped (and counted) rather than shortened.
         // Pieces are (start, end, bases covered): the count, not the endpoints, says when a join has gone round.
@@ -194,10 +243,9 @@ fn features(xml: &str, n: usize, circular: bool, cut: &mut usize) -> Result<(Vec
         let mut color = None;
         let mut valid = true;
         let mut b = body;
-        while let Some(j) = b.find("<Segment ") {
-            b = &b[j + 9..];
-            let end = b.find('>').ok_or("an unterminated segment tag")?;
-            let seg = &b[..end];
+        while let Some(j) = next_open(b, "Segment")? {
+            b = &b[j..];
+            let (seg, end) = tag_of(b, "Segment")?;
             // A gap segment marks the stretch between two parts: not covered by the feature.
             if attr(seg, "type").as_deref() == Some("gap") {
                 b = &b[end..];
@@ -285,20 +333,21 @@ fn primers(xml: &str, n: usize, circular: bool, room: usize, cut: &mut usize) ->
     let mut skipped = 0;
     let mut rest = xml;
     // An unfinished tag or primer is a damaged file, refused as the feature list's are: nothing is dropped silently.
-    while let Some(i) = rest.find("<Primer ") {
-        rest = &rest[i + 8..];
-        let close = rest.find('>').ok_or("an unterminated primer tag")?;
-        let tag = &rest[..close];
+    while let Some(i) = next_open(rest, "Primer")? {
+        rest = &rest[i..];
+        let (tag, close) = tag_of(rest, "Primer")?;
         let body_end = if tag.ends_with('/') { close } else { rest.find("</Primer>").ok_or("an unterminated primer")? };
+        if next_open(&rest[close..body_end], "Primer")?.is_some() {
+            return Err("an unterminated primer".into());
+        }
         let body = &rest[close..body_end.max(close)];
         let name = bounded(attr(tag, "name").unwrap_or_else(|| "primer".into()), 200, cut);
         // Sites listed so far, looked up in constant time: a primer with many sites stays linear.
         let mut seen: std::collections::HashSet<(usize, usize, i8)> = std::collections::HashSet::new();
         let mut b = body;
-        while let Some(j) = b.find("<BindingSite ") {
-            b = &b[j + 13..];
-            let end = b.find('>').ok_or("an unterminated binding site tag")?;
-            let site = &b[..end];
+        while let Some(j) = next_open(b, "BindingSite")? {
+            b = &b[j..];
+            let (site, end) = tag_of(b, "BindingSite")?;
             b = &b[end..];
             // A site whose location is not on the sequence is left out and counted, as a feature's is.
             let Some((s0, s1)) = attr(site, "location").and_then(|l| {
@@ -563,6 +612,21 @@ mod tests {
         assert_eq!(with(r#"<Primers><Primer name="p""#).unwrap_err(), "an unterminated primer tag");
         assert_eq!(with(r#"<Primers><Primer name="p"><BindingSite location="1-2" boundStrand="banana"/></Primer></Primers>"#).unwrap_err(),
             "a binding site's strand is neither 0 nor 1");
+        // A later tag's delimiter is never borrowed, and a malformed attribute is never read as absent.
+        for (xml, why) in [
+            (r#"<Primers><Primer name="p"><BindingSite location="1-2"<BindingSite location="2-3"/></Primer></Primers>"#, "a damaged binding site tag"),
+            (r#"<Primers><Primer name="p"><BindingSite location="1-2"/><Primer name="q"><BindingSite location="2-3"/></Primer></Primers>"#, "an unterminated primer"),
+            (r#"<Primers><Primer name="p"><BindingSite location="1-4" boundStrand=1/></Primer></Primers>"#, "a damaged binding site tag"),
+            (r#"<Primers><Primer name="p"><BindingSite location="1-4" boundStrand="1/></Primer></Primers>"#, "a damaged binding site tag"),
+            (r#"<Primers><Primer name="p"><BindingSite location="1-4" boundStrand/></Primer></Primers>"#, "a damaged binding site tag"),
+            (r#"<Primers><Primer"#, "an unterminated primer tag"),
+        ] {
+            assert_eq!(with(xml).unwrap_err(), why, "{xml}");
+        }
+        // The same for features and their segments.
+        let feats = |xml: &str| parse(&file(b"ACGTACGTACGT", 1, xml), 100);
+        assert_eq!(feats(r#"<Features><Feature name="f" type="gene"><Segment range="1-2" <Segment range="4-6"/></Feature></Features>"#).unwrap_err(), "a damaged segment tag");
+        assert_eq!(feats(r#"<Features><Feature name="f" type="gene"><Segment range="1-2"/><Feature name="g" type="gene"><Segment range="4-6"/></Feature></Features>"#).unwrap_err(), "an unterminated feature");
     }
 
     #[test]
