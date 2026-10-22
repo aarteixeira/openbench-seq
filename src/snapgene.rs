@@ -81,11 +81,11 @@ pub fn parse(bytes: &[u8], max_len: usize) -> Result<Dna, String> {
     let (seq, circular) = dna.ok_or("the file has no sequence")?;
     let mut cut = 0;
     let (mut features, skipped) = match xml {
-        Some(x) => features(&String::from_utf8_lossy(x), seq.len(), circular, &mut cut)?,
+        Some(x) => features(std::str::from_utf8(x).map_err(|_| "the feature list is not UTF-8 text")?, seq.len(), circular, &mut cut)?,
         None => (vec![], 0),
     };
     if let Some(x) = primer_xml {
-        let found = primers(&String::from_utf8_lossy(x), seq.len(), circular, MAX_FEATURES - features.len(), &mut cut)?;
+        let found = primers(std::str::from_utf8(x).map_err(|_| "the primer list is not UTF-8 text")?, seq.len(), circular, MAX_FEATURES - features.len(), &mut cut)?;
         features.extend(found);
     }
     Ok(Dna { seq, circular, features, skipped, cut })
@@ -276,7 +276,8 @@ fn primers(xml: &str, n: usize, circular: bool, room: usize, cut: &mut usize) ->
         let body_end = if tag.ends_with('/') { close } else { rest.find("</Primer>").unwrap_or(rest.len()) };
         let body = &rest[close..body_end.max(close)];
         let name = bounded(attr(tag, "name").unwrap_or_else(|| "primer".into()), 200, cut);
-        let mut seen: Vec<(usize, usize, i8)> = Vec::new();
+        // Sites listed so far, looked up in constant time: a primer with many sites stays linear.
+        let mut seen: std::collections::HashSet<(usize, usize, i8)> = std::collections::HashSet::new();
         let mut b = body;
         while let Some(j) = b.find("<BindingSite ") {
             b = &b[j + 13..];
@@ -304,7 +305,7 @@ fn primers(xml: &str, n: usize, circular: bool, room: usize, cut: &mut usize) ->
             if out.len() == room {
                 return Err(too_many());
             }
-            seen.push((start, end, direction));
+            seen.insert((start, end, direction));
             out.push(Feature { name: name.clone(), kind: "primer_bind".into(), start, end, direction, color: None, group: None });
         }
         rest = &rest[body_end.max(close)..];
@@ -535,5 +536,20 @@ mod tests {
         let with_primers = |k: usize| { let mut f = file(b"ACGTACGTAC", 0, &feats(MAX_FEATURES - 1, 1)); f.extend(packet(0x05, format!("<Primers>{}</Primers>", site.repeat(k)).as_bytes())); f };
         assert_eq!(parse(&with_primers(1), 100).unwrap().features.len(), MAX_FEATURES);
         assert_eq!(parse(&with_primers(2), 100).unwrap_err(), too_many());
+    }
+
+    #[test]
+    fn xml_that_is_not_utf8_is_refused_and_many_sites_stay_linear() {
+        let mut bad = file(b"ACGTACGTAC", 0, "<Features><Feature name=\"x\" type=\"misc_feature\"><Segment range=\"1-2\"/></Feature></Features>");
+        let at = bad.windows(4).position(|w| w == b"\"x\" ").unwrap() + 1;
+        bad[at] = 0xff;
+        assert_eq!(parse(&bad, 100).unwrap_err(), "the feature list is not UTF-8 text");
+        // 40,000 distinct sites of one primer, each also listed as its simplified repeat: one pass, not one scan per site.
+        let sites: String = (0..40_000).map(|i| format!(r#"<BindingSite location="{i}-{}" boundStrand="0"/><BindingSite simplified="1" location="{i}-{}" boundStrand="0"/>"#, i + 1, i + 1)).collect();
+        let mut f = file(&b"ACGT".repeat(10_001), 0, "<Features/>");
+        f.extend(packet(0x05, format!(r#"<Primers><Primer name="p">{sites}</Primer></Primers>"#).as_bytes()));
+        let t = std::time::Instant::now();
+        assert_eq!(parse(&f, 100_000).unwrap().features.len(), 40_000);
+        assert!(t.elapsed().as_secs() < 2, "{:?}", t.elapsed());
     }
 }
