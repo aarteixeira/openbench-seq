@@ -81,11 +81,11 @@ pub fn parse(bytes: &[u8], max_len: usize) -> Result<Dna, String> {
     let (seq, circular) = dna.ok_or("the file has no sequence")?;
     let mut cut = 0;
     let (mut features, mut skipped) = match xml {
-        Some(x) => features(std::str::from_utf8(x).map_err(|_| "the feature list is not UTF-8 text")?, seq.len(), circular, &mut cut)?,
+        Some(x) => features(xml_text(x, "feature list")?, seq.len(), circular, &mut cut)?,
         None => (vec![], 0),
     };
     if let Some(x) = primer_xml {
-        let (found, left_out) = primers(std::str::from_utf8(x).map_err(|_| "the primer list is not UTF-8 text")?, seq.len(), circular, MAX_FEATURES - features.len(), &mut cut)?;
+        let (found, left_out) = primers(xml_text(x, "primer list")?, seq.len(), circular, MAX_FEATURES - features.len(), &mut cut)?;
         features.extend(found);
         skipped += left_out;
     }
@@ -93,6 +93,21 @@ pub fn parse(bytes: &[u8], max_len: usize) -> Result<Dna, String> {
 }
 
 /// An element's name as messages say it.
+/// A feature or primer packet as text. Past a leading `<?xml ...?>` declaration, comments, CDATA, DOCTYPEs (`<!`) and
+/// processing instructions (`<?`) are refused, not read: the element scan does not know their bounds, and a tag inside
+/// one would be taken for a real element. SnapGene writes only the declaration.
+fn xml_text<'a>(x: &'a [u8], what: &str) -> Result<&'a str, String> {
+    let s = std::str::from_utf8(x).map_err(|_| format!("the {what} is not UTF-8 text"))?;
+    let body = match s.trim_start().strip_prefix("<?xml") {
+        Some(d) if d.starts_with(char::is_whitespace) => d.find("?>").map_or("", |e| &d[e + 2..]),
+        _ => s,
+    };
+    if body.contains("<!") || body.contains("<?") {
+        return Err(format!("the {what} holds XML comments, CDATA, a DOCTYPE or processing instructions, which are not read"));
+    }
+    Ok(s)
+}
+
 fn label(name: &str) -> String {
     match name {
         "BindingSite" => "binding site".into(),
@@ -658,6 +673,14 @@ mod tests {
         ] {
             assert_eq!(with(xml).unwrap_err(), why, "{xml}");
         }
+        // A tag inside a comment or CDATA is no element: both are refused, never read as primers or features.
+        for xml in [r#"<Primers><Primer name="p"><!-- <BindingSite location="0-2" boundStrand="1"/> --></Primer></Primers>"#,
+                    r#"<Primers><Primer name="p"><![CDATA[<BindingSite location="0-2" boundStrand="1"/>]]></Primer></Primers>"#,
+                    r#"<?xml version="1.0"?><Primers><Primer name="p"><?x <BindingSite location="0-2" boundStrand="1"/> ?></Primer></Primers>"#] {
+            assert_eq!(with(xml).unwrap_err(), "the primer list holds XML comments, CDATA, a DOCTYPE or processing instructions, which are not read");
+        }
+        assert_eq!(parse(&file(b"ACGTACGTACGT", 1, r#"<Features><!-- <Feature name="f" type="gene"><Segment range="1-4"/></Feature> --></Features>"#), 100).unwrap_err(),
+            "the feature list holds XML comments, CDATA, a DOCTYPE or processing instructions, which are not read");
         // The same for features and their segments.
         let feats = |xml: &str| parse(&file(b"ACGTACGTACGT", 1, xml), 100);
         assert_eq!(feats(r#"<Features><Feature name="f" type="gene"><Segment range="1-2" <Segment range="4-6"/></Feature></Features>"#).unwrap_err(), "a damaged segment tag");
