@@ -226,11 +226,14 @@ fn features(xml: &str, n: usize, circular: bool) -> Result<(Vec<Feature>, usize)
         let name: String = attr(tag, "name").unwrap_or_else(|| "feature".into()).chars().take(200).collect();
         let kind: String = attr(tag, "type").unwrap_or_else(|| "misc_feature".into()).chars().take(40).collect();
         // Separate segments stay separate (one annotation each, numbered), so the gaps between them stay uncovered. Parts
-        // are numbered in reading order: from the last segment on the reverse strand.
+        // are listed and numbered in reading order, part 1 first: from the last segment on the reverse strand.
         let parts = segments.len();
         let group = (parts > 1).then_some(out.len());
+        if direction == -1 {
+            segments.reverse();
+        }
         for (i, (start, end, _)) in segments.into_iter().enumerate() {
-            let k = if direction == -1 { parts - i } else { i + 1 };
+            let k = i + 1;
             let name = if parts == 1 { name.clone() } else { format!("{name} (part {k} of {parts})") };
             out.push(Feature { name, kind: kind.clone(), start, end, direction, color: color.clone(), group });
         }
@@ -482,7 +485,7 @@ mod tests {
         let xml = r#"<Features><Feature name="t" directionality="2" type="terminator"><Segment range="3-4" type="standard"/><Segment range="5-6" type="gap"/><Segment range="7-8" type="standard"/><Segment range="9-10" type="standard"/></Feature></Features>"#;
         let d = parse(&file(b"ACGTACGTACGT", 0, xml), 100).unwrap();
         let got: Vec<_> = d.features.iter().map(|f| (f.name.as_str(), f.start, f.end, f.direction, f.group)).collect();
-        assert_eq!(got, [("t (part 2 of 2)", 2, 4, -1, Some(0)), ("t (part 1 of 2)", 6, 10, -1, Some(0))]);
+        assert_eq!(got, [("t (part 1 of 2)", 6, 10, -1, Some(0)), ("t (part 2 of 2)", 2, 4, -1, Some(0))]);
         assert!(to_json(&d).contains(r#""direction":-1,"group":"g0"}"#));
     }
 
