@@ -22,6 +22,9 @@ pub struct Feature {
     pub end: usize,
     pub direction: i8,
     pub color: Option<String>,
+    /// The parts of one feature share a group (written as "g<n>"), so a reader can join them again: a CDS in parts is
+    /// translated across its parts, not part by part.
+    pub group: Option<usize>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -225,10 +228,11 @@ fn features(xml: &str, n: usize, circular: bool) -> Result<(Vec<Feature>, usize)
         // Separate segments stay separate (one annotation each, numbered), so the gaps between them stay uncovered. Parts
         // are numbered in reading order: from the last segment on the reverse strand.
         let parts = segments.len();
+        let group = (parts > 1).then_some(out.len());
         for (i, (start, end, _)) in segments.into_iter().enumerate() {
             let k = if direction == -1 { parts - i } else { i + 1 };
             let name = if parts == 1 { name.clone() } else { format!("{name} (part {k} of {parts})") };
-            out.push(Feature { name, kind: kind.clone(), start, end, direction, color: color.clone() });
+            out.push(Feature { name, kind: kind.clone(), start, end, direction, color: color.clone(), group });
         }
     }
     Ok((out, skipped))
@@ -284,7 +288,7 @@ fn primers(xml: &str, n: usize, circular: bool, room: usize) -> Result<Vec<Featu
                 return Err(too_many());
             }
             seen.push((start, end, direction));
-            out.push(Feature { name: name.clone(), kind: "primer_bind".into(), start, end, direction, color: None });
+            out.push(Feature { name: name.clone(), kind: "primer_bind".into(), start, end, direction, color: None, group: None });
         }
         rest = &rest[body_end.max(close)..];
     }
@@ -310,6 +314,9 @@ pub fn to_json(d: &Dna) -> String {
         if let Some(c) = &f.color {
             s.push_str(",\"color\":");
             json::string(&mut s, c);
+        }
+        if let Some(g) = f.group {
+            s.push_str(&format!(",\"group\":\"g{g}\""));
         }
         s.push('}');
     }
@@ -474,8 +481,9 @@ mod tests {
     fn gap_segments_are_not_covered_and_reverse_parts_count_from_the_end() {
         let xml = r#"<Features><Feature name="t" directionality="2" type="terminator"><Segment range="3-4" type="standard"/><Segment range="5-6" type="gap"/><Segment range="7-8" type="standard"/><Segment range="9-10" type="standard"/></Feature></Features>"#;
         let d = parse(&file(b"ACGTACGTACGT", 0, xml), 100).unwrap();
-        let got: Vec<_> = d.features.iter().map(|f| (f.name.as_str(), f.start, f.end, f.direction)).collect();
-        assert_eq!(got, [("t (part 2 of 2)", 2, 4, -1), ("t (part 1 of 2)", 6, 10, -1)]);
+        let got: Vec<_> = d.features.iter().map(|f| (f.name.as_str(), f.start, f.end, f.direction, f.group)).collect();
+        assert_eq!(got, [("t (part 2 of 2)", 2, 4, -1, Some(0)), ("t (part 1 of 2)", 6, 10, -1, Some(0))]);
+        assert!(to_json(&d).contains(r#""direction":-1,"group":"g0"}"#));
     }
 
     #[test]
