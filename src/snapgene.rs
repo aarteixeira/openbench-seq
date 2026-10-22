@@ -80,13 +80,14 @@ pub fn parse(bytes: &[u8], max_len: usize) -> Result<Dna, String> {
     }
     let (seq, circular) = dna.ok_or("the file has no sequence")?;
     let mut cut = 0;
-    let (mut features, skipped) = match xml {
+    let (mut features, mut skipped) = match xml {
         Some(x) => features(std::str::from_utf8(x).map_err(|_| "the feature list is not UTF-8 text")?, seq.len(), circular, &mut cut)?,
         None => (vec![], 0),
     };
     if let Some(x) = primer_xml {
-        let found = primers(std::str::from_utf8(x).map_err(|_| "the primer list is not UTF-8 text")?, seq.len(), circular, MAX_FEATURES - features.len(), &mut cut)?;
+        let (found, left_out) = primers(std::str::from_utf8(x).map_err(|_| "the primer list is not UTF-8 text")?, seq.len(), circular, MAX_FEATURES - features.len(), &mut cut)?;
         features.extend(found);
+        skipped += left_out;
     }
     Ok(Dna { seq, circular, features, skipped, cut })
 }
@@ -150,8 +151,8 @@ fn unescape(s: &str) -> String {
 }
 
 // 1-based inclusive "a-b" (or a single "a") to a 0-based [start, end), checked against the sequence length. On a circle
-// a > b wraps the origin (end < start), and b = a - 1 is the whole circle, [0, n); on a linear sequence a > b is
-// invalid.
+// a > b wraps the origin (end < start), and b = a - 1 is the whole circle from a: (a - 1, a - 1), its start kept (a CDS
+// reads from it); on a linear sequence a > b is invalid.
 fn range(r: &str, n: usize, circular: bool) -> Option<(usize, usize)> {
     let (a, b) = r.split_once('-').unwrap_or((r, r));
     let (a, b): (usize, usize) = (a.trim().parse().ok()?, b.trim().parse().ok()?);
@@ -161,7 +162,7 @@ fn range(r: &str, n: usize, circular: bool) -> Option<(usize, usize)> {
     match (a <= b, circular) {
         (true, _) => Some((a - 1, b)),
         (false, false) => None,
-        (false, true) if b == a - 1 => Some((0, n)),
+        (false, true) if b == a - 1 => Some((a - 1, a - 1)),
         (false, true) => Some((a - 1, b)),
     }
 }
@@ -210,7 +211,7 @@ fn features(xml: &str, n: usize, circular: bool, cut: &mut usize) -> Result<(Vec
                     match segments.last_mut() {
                         Some(last) if last.2 >= n => {}
                         Some(last) if last.1 == r.0 || (circular && last.1 == n && r.0 == 0) => {
-                            *last = if last.2 + len >= n { (0, n, n) } else { (last.0, r.1, last.2 + len) };
+                            *last = if last.2 + len >= n { (last.0, last.0, n) } else { (last.0, r.1, last.2 + len) };
                         }
                         _ => {
                             if out.len() + segments.len() >= MAX_FEATURES {
@@ -239,6 +240,19 @@ fn features(xml: &str, n: usize, circular: bool, cut: &mut usize) -> Result<(Vec
         };
         let name = bounded(attr(tag, "name").unwrap_or_else(|| "feature".into()), 200, cut);
         let kind = bounded(attr(tag, "type").unwrap_or_else(|| "misc_feature".into()), 40, cut);
+        // A piece round the whole circle is [0, n), except a CDS's that starts elsewhere: its reading starts there, so it
+        // stays two parts, from its start to the end and from the origin back to its start (as the GenBank reader keeps it).
+        let mut segments: Vec<(usize, usize, usize)> = segments
+            .into_iter()
+            .flat_map(|(start, end, len)| match (len >= n, start != 0 && kind == "CDS") {
+                (true, true) => vec![(start, n, n - start), (0, start, start)],
+                (true, false) => vec![(0, n, n)],
+                _ => vec![(start, end, len)],
+            })
+            .collect();
+        if out.len() + segments.len() > MAX_FEATURES {
+            return Err(too_many());
+        }
         // Separate segments stay separate (one annotation each, numbered), so the gaps between them stay uncovered. Parts
         // are listed and numbered in reading order, part 1 first: from the last segment on the reverse strand.
         let parts = segments.len();
@@ -259,7 +273,7 @@ fn features(xml: &str, n: usize, circular: bool, cut: &mut usize) -> Result<(Vec
 // temperature fall short of the file's hybridization parameters is not shown, nor a "simplified" site repeating one
 // already listed. Binding-site locations are 0-based and inclusive ("751-775" is [751, 776)), unlike segments; a
 // site bound to the bottom strand (boundStrand 1) is a reverse primer. A site outside the sequence is left out.
-fn primers(xml: &str, n: usize, circular: bool, room: usize, cut: &mut usize) -> Result<Vec<Feature>, String> {
+fn primers(xml: &str, n: usize, circular: bool, room: usize, cut: &mut usize) -> Result<(Vec<Feature>, usize), String> {
     let num = |s: Option<String>| s.and_then(|v| v.trim().parse::<i64>().ok());
     let (mut min_len, mut min_tm) = (0, 0);
     if let Some(i) = xml.find("<HybridizationParams") {
@@ -268,12 +282,14 @@ fn primers(xml: &str, n: usize, circular: bool, room: usize, cut: &mut usize) ->
         min_tm = num(attr(tag, "minMeltingTemperature")).unwrap_or(0);
     }
     let mut out = Vec::new();
+    let mut skipped = 0;
     let mut rest = xml;
+    // An unfinished tag or primer is a damaged file, refused as the feature list's are: nothing is dropped silently.
     while let Some(i) = rest.find("<Primer ") {
         rest = &rest[i + 8..];
-        let Some(close) = rest.find('>') else { break };
+        let close = rest.find('>').ok_or("an unterminated primer tag")?;
         let tag = &rest[..close];
-        let body_end = if tag.ends_with('/') { close } else { rest.find("</Primer>").unwrap_or(rest.len()) };
+        let body_end = if tag.ends_with('/') { close } else { rest.find("</Primer>").ok_or("an unterminated primer")? };
         let body = &rest[close..body_end.max(close)];
         let name = bounded(attr(tag, "name").unwrap_or_else(|| "primer".into()), 200, cut);
         // Sites listed so far, looked up in constant time: a primer with many sites stays linear.
@@ -281,19 +297,28 @@ fn primers(xml: &str, n: usize, circular: bool, room: usize, cut: &mut usize) ->
         let mut b = body;
         while let Some(j) = b.find("<BindingSite ") {
             b = &b[j + 13..];
-            let Some(end) = b.find('>') else { break };
+            let end = b.find('>').ok_or("an unterminated binding site tag")?;
             let site = &b[..end];
             b = &b[end..];
+            // A site whose location is not on the sequence is left out and counted, as a feature's is.
             let Some((s0, s1)) = attr(site, "location").and_then(|l| {
                 let (a, z) = l.split_once('-')?;
                 Some((a.trim().parse::<usize>().ok()?, z.trim().parse::<usize>().ok()?))
-            }) else { continue };
+            }) else {
+                skipped += 1;
+                continue;
+            };
             if s0 >= n || s1 >= n || (s0 > s1 && !circular) {
+                skipped += 1;
                 continue;
             }
             // Across the origin of a circle when s0 > s1; one base short of a full turn reads as the whole circle.
             let (start, end) = if s0 <= s1 || s1 + 1 != s0 { (s0, s1 + 1) } else { (0, n) };
-            let direction = if attr(site, "boundStrand").as_deref() == Some("1") { -1 } else { 1 };
+            let direction = match attr(site, "boundStrand").as_deref() {
+                Some("1") => -1,
+                None | Some("0") => 1,
+                Some(_) => return Err("a binding site's strand is neither 0 nor 1".into()),
+            };
             if attr(site, "simplified").as_deref() == Some("1") && seen.contains(&(start, end, direction)) {
                 continue;
             }
@@ -310,7 +335,7 @@ fn primers(xml: &str, n: usize, circular: bool, room: usize, cut: &mut usize) ->
         }
         rest = &rest[body_end.max(close)..];
     }
-    Ok(out)
+    Ok((out, skipped))
 }
 
 pub fn to_json(d: &Dna) -> String {
@@ -518,8 +543,38 @@ mod tests {
         let d = parse(&f, 100).unwrap();
         let got: Vec<_> = d.features.iter().map(|f| (f.kind.as_str(), f.start, f.end, f.direction)).collect();
         // [2, 6) forward once (the simplified repeat dropped); [8, 2) across the origin, reverse; the short, cold and
-        // out-of-range sites left out.
+        // out-of-range sites left out (the out-of-range one counted as skipped; the short and cold ones are filtered, as
+        // SnapGene shows them).
         assert_eq!(got, [("primer_bind", 2, 6, 1), ("primer_bind", 8, 2, -1)]);
+        assert_eq!(d.skipped, 1);
+    }
+
+    #[test]
+    fn damaged_primer_lists_are_refused() {
+        let with = |primers: &str| {
+            let mut f = file(b"ACGTACGTACGT", 1, "<Features/>");
+            f.extend(packet(0x05, primers.as_bytes()));
+            parse(&f, 100)
+        };
+        // Framed packets whose XML stops inside a tag or before </Primer>, and a strand that is neither 0 nor 1.
+        assert_eq!(with(r#"<Primers><Primer name="p"><BindingSite location="1-2""#).unwrap_err(), "an unterminated primer");
+        assert_eq!(with(r#"<Primers><Primer name="p"><BindingSite location="1-2"</Primer></Primers>"#).unwrap_err(), "an unterminated binding site tag");
+        assert_eq!(with(r#"<Primers><Primer name="p"><BindingSite location="1-2"/>"#).unwrap_err(), "an unterminated primer");
+        assert_eq!(with(r#"<Primers><Primer name="p""#).unwrap_err(), "an unterminated primer tag");
+        assert_eq!(with(r#"<Primers><Primer name="p"><BindingSite location="1-2" boundStrand="banana"/></Primer></Primers>"#).unwrap_err(),
+            "a binding site's strand is neither 0 nor 1");
+    }
+
+    #[test]
+    fn a_cds_round_the_whole_circle_keeps_its_start() {
+        // AATGAAACCCTA, circular, a CDS 2-1: it reads from base 2 (ATG AAA CCC TAA), as two parts in reading order; another
+        // type round the circle is [0, n).
+        let cds = |dir: &str, kind: &str| format!(r#"<Features><Feature name="c" directionality="{dir}" type="{kind}"><Segment range="2-1"/></Feature></Features>"#);
+        let got = |xml: String| parse(&file(b"AATGAAACCCTA", 1, &xml), 100).unwrap().features.iter().map(|f| (f.name.clone(), f.start, f.end, f.group)).collect::<Vec<_>>();
+        assert_eq!(got(cds("1", "CDS")), [("c (part 1 of 2)".into(), 1, 12, Some(0)), ("c (part 2 of 2)".into(), 0, 1, Some(0))]);
+        // On the reverse strand it reads from base 1 down: the part ending at its start comes first.
+        assert_eq!(got(cds("2", "CDS")), [("c (part 1 of 2)".into(), 0, 1, Some(0)), ("c (part 2 of 2)".into(), 1, 12, Some(0))]);
+        assert_eq!(got(cds("1", "gene")), [("c".into(), 0, 12, None)]);
     }
 
     #[test]
