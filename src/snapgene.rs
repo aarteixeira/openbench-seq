@@ -92,22 +92,24 @@ pub fn parse(bytes: &[u8], max_len: usize) -> Result<Dna, String> {
     Ok(Dna { seq, circular, features, skipped, cut })
 }
 
-/// An element's name as messages say it.
 /// A feature or primer packet as text. Past a leading `<?xml ...?>` declaration, comments, CDATA, DOCTYPEs (`<!`) and
 /// processing instructions (`<?`) are refused, not read: the element scan does not know their bounds, and a tag inside
-/// one would be taken for a real element. SnapGene writes only the declaration.
+/// one would be taken for a real element. SnapGene writes only the declaration (after a byte order mark, possibly).
 fn xml_text<'a>(x: &'a [u8], what: &str) -> Result<&'a str, String> {
     let s = std::str::from_utf8(x).map_err(|_| format!("the {what} is not UTF-8 text"))?;
-    let body = match s.trim_start().strip_prefix("<?xml") {
-        Some(d) if d.starts_with(char::is_whitespace) => d.find("?>").map_or("", |e| &d[e + 2..]),
+    let refused = || format!("the {what} holds XML this reader does not read (a comment or similar); save the file again in SnapGene, or export it as GenBank");
+    let body = match s.trim_start_matches('\u{feff}').trim_start().strip_prefix("<?xml") {
+        // An unfinished declaration is refused too: the text after it is never let through unchecked.
+        Some(d) if d.starts_with(char::is_whitespace) => &d[d.find("?>").ok_or_else(refused)? + 2..],
         _ => s,
     };
     if body.contains("<!") || body.contains("<?") {
-        return Err(format!("the {what} holds XML comments, CDATA, a DOCTYPE or processing instructions, which are not read"));
+        return Err(refused());
     }
     Ok(s)
 }
 
+/// An element's name as messages say it.
 fn label(name: &str) -> String {
     match name {
         "BindingSite" => "binding site".into(),
@@ -676,11 +678,16 @@ mod tests {
         // A tag inside a comment or CDATA is no element: both are refused, never read as primers or features.
         for xml in [r#"<Primers><Primer name="p"><!-- <BindingSite location="0-2" boundStrand="1"/> --></Primer></Primers>"#,
                     r#"<Primers><Primer name="p"><![CDATA[<BindingSite location="0-2" boundStrand="1"/>]]></Primer></Primers>"#,
-                    r#"<?xml version="1.0"?><Primers><Primer name="p"><?x <BindingSite location="0-2" boundStrand="1"/> ?></Primer></Primers>"#] {
-            assert_eq!(with(xml).unwrap_err(), "the primer list holds XML comments, CDATA, a DOCTYPE or processing instructions, which are not read");
+                    r#"<?xml version="1.0"?><Primers><Primer name="p"><?x <BindingSite location="0-2" boundStrand="1"/> ?></Primer></Primers>"#,
+                    // A declaration never finished does not hide what follows it.
+                    r#"<?xml version="1.0"<Primers><Primer name="p"><!-- <BindingSite location="0-2" boundStrand="1"/> --></Primer></Primers>"#] {
+            assert_eq!(with(xml).unwrap_err(), "the primer list holds XML this reader does not read (a comment or similar); save the file again in SnapGene, or export it as GenBank");
         }
+        // The declaration SnapGene writes, after a byte order mark, is read.
+        assert_eq!(one("\u{feff}<?xml version=\"1.0\"?><Primers><Primer name=\"p\"><BindingSite location=\"1-4\"/></Primer></Primers>").unwrap(),
+            [("p".to_string(), 1, 5, 1)]);
         assert_eq!(parse(&file(b"ACGTACGTACGT", 1, r#"<Features><!-- <Feature name="f" type="gene"><Segment range="1-4"/></Feature> --></Features>"#), 100).unwrap_err(),
-            "the feature list holds XML comments, CDATA, a DOCTYPE or processing instructions, which are not read");
+            "the feature list holds XML this reader does not read (a comment or similar); save the file again in SnapGene, or export it as GenBank");
         // The same for features and their segments.
         let feats = |xml: &str| parse(&file(b"ACGTACGTACGT", 1, xml), 100);
         assert_eq!(feats(r#"<Features><Feature name="f" type="gene"><Segment range="1-2" <Segment range="4-6"/></Feature></Features>"#).unwrap_err(), "a damaged segment tag");
