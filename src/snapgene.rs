@@ -34,6 +34,8 @@ pub struct Dna {
     pub features: Vec<Feature>,
     /// Features left out because none of their segments lies within the sequence; the caller says so.
     pub skipped: usize,
+    /// Names (200 characters) and types (40) cut to OpenBench's stored lengths; the caller says so.
+    pub cut: usize,
 }
 
 pub fn parse(bytes: &[u8], max_len: usize) -> Result<Dna, String> {
@@ -77,15 +79,16 @@ pub fn parse(bytes: &[u8], max_len: usize) -> Result<Dna, String> {
         }
     }
     let (seq, circular) = dna.ok_or("the file has no sequence")?;
+    let mut cut = 0;
     let (mut features, skipped) = match xml {
-        Some(x) => features(&String::from_utf8_lossy(x), seq.len(), circular)?,
+        Some(x) => features(&String::from_utf8_lossy(x), seq.len(), circular, &mut cut)?,
         None => (vec![], 0),
     };
     if let Some(x) = primer_xml {
-        let found = primers(&String::from_utf8_lossy(x), seq.len(), circular, MAX_FEATURES - features.len())?;
+        let found = primers(&String::from_utf8_lossy(x), seq.len(), circular, MAX_FEATURES - features.len(), &mut cut)?;
         features.extend(found);
     }
-    Ok(Dna { seq, circular, features, skipped })
+    Ok(Dna { seq, circular, features, skipped, cut })
 }
 
 // Attribute `name` of the tag text starting after `<Tag`.
@@ -163,7 +166,18 @@ fn range(r: &str, n: usize, circular: bool) -> Option<(usize, usize)> {
     }
 }
 
-fn features(xml: &str, n: usize, circular: bool) -> Result<(Vec<Feature>, usize), String> {
+/// `s` cut to `max` characters, counted in `cut` when it was longer.
+fn bounded(s: String, max: usize, cut: &mut usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((at, _)) => {
+            *cut += 1;
+            s[..at].to_string()
+        }
+        None => s,
+    }
+}
+
+fn features(xml: &str, n: usize, circular: bool, cut: &mut usize) -> Result<(Vec<Feature>, usize), String> {
     let mut out = Vec::new();
     let mut skipped = 0;
     let mut rest = xml;
@@ -223,8 +237,8 @@ fn features(xml: &str, n: usize, circular: bool) -> Result<(Vec<Feature>, usize)
             Some("2") => -1,
             _ => 0,
         };
-        let name: String = attr(tag, "name").unwrap_or_else(|| "feature".into()).chars().take(200).collect();
-        let kind: String = attr(tag, "type").unwrap_or_else(|| "misc_feature".into()).chars().take(40).collect();
+        let name = bounded(attr(tag, "name").unwrap_or_else(|| "feature".into()), 200, cut);
+        let kind = bounded(attr(tag, "type").unwrap_or_else(|| "misc_feature".into()), 40, cut);
         // Separate segments stay separate (one annotation each, numbered), so the gaps between them stay uncovered. Parts
         // are listed and numbered in reading order, part 1 first: from the last segment on the reverse strand.
         let parts = segments.len();
@@ -245,7 +259,7 @@ fn features(xml: &str, n: usize, circular: bool) -> Result<(Vec<Feature>, usize)
 // temperature fall short of the file's hybridization parameters is not shown, nor a "simplified" site repeating one
 // already listed. Binding-site locations are 0-based and inclusive ("751-775" is [751, 776)), unlike segments; a
 // site bound to the bottom strand (boundStrand 1) is a reverse primer. A site outside the sequence is left out.
-fn primers(xml: &str, n: usize, circular: bool, room: usize) -> Result<Vec<Feature>, String> {
+fn primers(xml: &str, n: usize, circular: bool, room: usize, cut: &mut usize) -> Result<Vec<Feature>, String> {
     let num = |s: Option<String>| s.and_then(|v| v.trim().parse::<i64>().ok());
     let (mut min_len, mut min_tm) = (0, 0);
     if let Some(i) = xml.find("<HybridizationParams") {
@@ -261,7 +275,7 @@ fn primers(xml: &str, n: usize, circular: bool, room: usize) -> Result<Vec<Featu
         let tag = &rest[..close];
         let body_end = if tag.ends_with('/') { close } else { rest.find("</Primer>").unwrap_or(rest.len()) };
         let body = &rest[close..body_end.max(close)];
-        let name: String = attr(tag, "name").unwrap_or_else(|| "primer".into()).chars().take(200).collect();
+        let name = bounded(attr(tag, "name").unwrap_or_else(|| "primer".into()), 200, cut);
         let mut seen: Vec<(usize, usize, i8)> = Vec::new();
         let mut b = body;
         while let Some(j) = b.find("<BindingSite ") {
@@ -303,7 +317,7 @@ pub fn to_json(d: &Dna) -> String {
     s.push_str("{\"seq\":");
     json::string(&mut s, &d.seq);
     s.push_str(if d.circular { ",\"circular\":true" } else { ",\"circular\":false" });
-    s.push_str(&format!(",\"skipped\":{}", d.skipped));
+    s.push_str(&format!(",\"skipped\":{},\"cut\":{}", d.skipped, d.cut));
     s.push_str(",\"features\":[");
     for (i, f) in d.features.iter().enumerate() {
         if i > 0 {
@@ -437,7 +451,7 @@ mod tests {
         let xml = format!(r#"<Features><Feature name="{name}" type="misc_feature"><Segment range="1-2"/></Feature></Features>"#);
         let t = std::time::Instant::now();
         let d = parse(&file(b"ACGTACGTAC", 0, &xml), 100).unwrap();
-        assert_eq!(d.features[0].name.len(), 200);
+        assert_eq!((d.features[0].name.len(), d.cut), (200, 1));
         assert!(t.elapsed().as_secs() < 2, "{:?}", t.elapsed());
     }
 
@@ -447,7 +461,7 @@ mod tests {
         f.extend(packet(0x00, b"\x00ACGT"));
         let d = parse(&f, 10).unwrap();
         assert!(!d.circular && d.features.is_empty());
-        assert_eq!(to_json(&d), r#"{"seq":"ACGT","circular":false,"skipped":0,"features":[]}"#);
+        assert_eq!(to_json(&d), r#"{"seq":"ACGT","circular":false,"skipped":0,"cut":0,"features":[]}"#);
     }
 
     #[test]
