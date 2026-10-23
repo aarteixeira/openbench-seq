@@ -295,8 +295,15 @@ fn cds_translation(tag: &Tag, body: &str) -> Result<(Option<u8>, Option<u8>, Opt
             _ => {}
         }
     }
+    // SnapGene's reading frame: its size is the frame (1 or the codon start), its sign the strand, which must be the
+    // feature's own when the feature states one (directionality 1 forward, 2 reverse).
     if let Some(rf) = tag.num("readingFrame", "a feature's reading frame")? {
-        if rf.abs() != 1 && rf.abs() != i64::from(codon) {
+        let strand = match tag.get("directionality").as_deref() {
+            Some("1") => 1,
+            Some("2") => -1,
+            _ => 0,
+        };
+        if (rf.abs() != 1 && rf.abs() != i64::from(codon)) || (strand != 0 && rf.signum() != strand) {
             refused = refused.or(Some("exception"));
         }
     }
@@ -803,19 +810,26 @@ mod tests {
     }
     #[test]
     fn a_cds_keeps_its_codon_start_and_code_and_is_refused_when_its_frame_is_not_stated() {
-        let cds = |attrs: &str, qs: &str| {
-            let xml = format!(r#"<Features><Feature name="c" type="CDS" directionality="1"{attrs}><Segment range="1-9"/>{qs}</Feature></Features>"#);
+        let cds_on = |dir: &str, attrs: &str, qs: &str| {
+            let xml = format!(r#"<Features><Feature name="c" type="CDS" directionality="{dir}"{attrs}><Segment range="1-9"/>{qs}</Feature></Features>"#);
             let f = &parse(&file(b"ATGAAATGACCCGTAA", 0, &xml), 100).unwrap().features[0];
             (f.codon_start, f.table, f.untranslated)
         };
+        let cds = |attrs: &str, qs: &str| cds_on("1", attrs, qs);
         let q = |name: &str, v: &str| format!(r#"<Q name="{name}"><V int="{v}"/></Q>"#);
         // Stated as GenBank states them: codon start, genetic code (1 when absent).
         assert_eq!(cds("", ""), (None, Some(1), None));
         assert_eq!(cds("", &(q("codon_start", "2") + &q("transl_table", "11"))), (Some(2), Some(11), None));
-        // SnapGene's reading frame agrees with codon_start (its sign is the strand), or is refused, never guessed.
-        assert_eq!(cds(r#" readingFrame="-2""#, &q("codon_start", "2")), (Some(2), Some(1), None));
-        assert_eq!(cds(r#" readingFrame="-1""#, ""), (None, Some(1), None));
+        // SnapGene's reading frame agrees with codon_start and its sign with the feature's strand, or the CDS is refused,
+        // never guessed.
+        assert_eq!(cds_on("2", r#" readingFrame="-2""#, &q("codon_start", "2")), (Some(2), Some(1), None));
+        assert_eq!(cds(r#" readingFrame="2""#, &q("codon_start", "2")), (Some(2), Some(1), None));
+        assert_eq!(cds_on("2", r#" readingFrame="-1""#, ""), (None, Some(1), None));
+        assert_eq!(cds_on("0", r#" readingFrame="-1""#, ""), (None, Some(1), None));
         assert_eq!(cds(r#" readingFrame="3""#, ""), (None, Some(1), Some("exception")));
+        // A frame on the other strand than the feature states.
+        assert_eq!(cds(r#" readingFrame="-2""#, &q("codon_start", "2")), (Some(2), Some(1), Some("exception")));
+        assert_eq!(cds_on("2", r#" readingFrame="1""#, "").2, Some("exception"));
         // Marks that refuse a translation, and values this reader cannot apply.
         assert_eq!(cds("", r#"<Q name="pseudo"/>"#).2, Some("pseudo"));
         assert_eq!(cds("", &q("transl_except", "1")).2, Some("exception"));
