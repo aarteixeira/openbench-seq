@@ -11,12 +11,14 @@
 #![deny(unsafe_code)]
 
 pub mod abif;
+pub mod align;
 pub mod alphabet;
 mod json;
 pub mod search;
 pub mod sites;
 pub mod snapgene;
 pub mod translate;
+pub mod verify;
 
 use std::cell::RefCell;
 
@@ -171,6 +173,77 @@ pub extern "C" fn ob_parse_abif() -> i32 {
     }
 }
 
+/// Align slot 1 (b) to slot 0 (a): mode 0 global, 1 local, 2 glocal; protein scoring when `protein`. Ints: score,
+/// a start, a end, b start, b end, then (operation, length) per run (0 match, 1 mismatch, 2 insertion, 3 deletion).
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn ob_align(mode: u32, protein: u32) -> i32 {
+    let (a, b) = (input(0), input(1));
+    let mode = match mode { 0 => align::Mode::Global, 1 => align::Mode::Local, 2 => align::Mode::Glocal, _ => return fail(-1, "unknown alignment mode") };
+    let sc = if protein != 0 { align::Scoring::PROTEIN } else { align::Scoring::DNA };
+    match align::align(&a, &b, mode, &sc, None) {
+        Ok(x) => {
+            let mut out = vec![x.score, x.a.0 as i32, x.a.1 as i32, x.b.0 as i32, x.b.1 as i32];
+            out.extend(x.ops.iter().flat_map(|&(o, n)| [o as i32, n as i32]));
+            ints(out)
+        }
+        Err(e) => fail(-1, e),
+    }
+}
+
+/// Mott trimming of the Phred values in slot 0 at `limit_milli` / 1000: ints start, end.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn ob_trim(limit_milli: u32) -> i32 {
+    let (s, e) = align::trim(&input(0), limit_milli as f64 / 1000.0);
+    ints(vec![s as i32, e as i32])
+}
+
+thread_local! {
+    static VERIFY: RefCell<Option<verify::Job>> = const { RefCell::new(None) };
+}
+
+/// Start a verification against the reference in slot 0: region [start, end), Phred threshold, trimming limit in
+/// thousandths. Reads follow one by one (`ob_verify_add`), then `ob_verify_end`.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn ob_verify_begin(circular: u32, start: u32, end: u32, min_q: u32, limit_milli: u32) -> i32 {
+    match verify::Job::new(&input(0), circular != 0, (start as usize, end as usize), min_q.min(255) as u8, limit_milli as f64 / 1000.0) {
+        Ok(j) => {
+            VERIFY.with(|v| *v.borrow_mut() = Some(j));
+            0
+        }
+        Err(e) => fail(-1, e),
+    }
+}
+
+/// Add a read: bases in slot 0, Phred values in slot 1 (one per base) when `has_quality`, its name in slot 2.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn ob_verify_add(has_quality: u32) -> i32 {
+    let (bases, quality, name) = (input(0), input(1), input(2));
+    if has_quality != 0 && quality.len() != bases.len() {
+        return fail(-1, "a read needs one quality value per base");
+    }
+    VERIFY.with(|v| match v.borrow_mut().as_mut() {
+        Some(j) => {
+            j.add(&String::from_utf8_lossy(&name), &bases, (has_quality != 0).then_some(&quality[..]));
+            0
+        }
+        None => fail(-1, "no verification was started"),
+    })
+}
+
+/// The verification's report as JSON bytes; the job ends.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn ob_verify_end() -> i32 {
+    match VERIFY.with(|v| v.borrow_mut().take()) {
+        Some(j) => bytes(verify::to_json(&j, &j.report()).into_bytes()),
+        None => fail(-1, "no verification was started"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,6 +267,28 @@ mod tests {
         put(1, b"GAATTC\t1\t5\t\nGATC\t0\t4\td");
         assert_eq!(ob_cuts(0), 3);
         assert_eq!(OUT_I32.with(|o| o.borrow().clone()), vec![0, 3, 0]);
+    }
+
+    #[test]
+    fn aligns_trims_and_verifies_through_the_abi() {
+        put(0, b"ACGTCACG");
+        put(1, b"ACGTACG");
+        assert_eq!(ob_align(0, 0), 11);
+        assert_eq!(OUT_I32.with(|o| o.borrow().clone()), vec![7, 0, 8, 0, 7, 0, 4, 3, 1, 0, 3]);
+        put(0, &[10, 10, 30, 30, 30, 30, 10, 10]);
+        assert_eq!(ob_trim(50), 2);
+        assert_eq!(OUT_I32.with(|o| o.borrow().clone()), vec![2, 6]);
+        let reference: Vec<u8> = (0..120).map(|i| b"ACGTTGCAAC"[(i * 7 + i / 3) % 10]).collect();
+        put(0, &reference);
+        assert_eq!(ob_verify_begin(0, 10, 110, 20, 50), 0);
+        put(0, &reference[5..115]);
+        put(1, &[40u8; 110]);
+        put(2, b"clone1_F");
+        assert_eq!(ob_verify_add(1), 0);
+        assert!(ob_verify_end() > 0);
+        let json = OUT_BYTES.with(|o| String::from_utf8(o.borrow().clone()).unwrap());
+        assert!(json.starts_with(r#"{"verdict":"pass","quality":true,"differences":[]"#), "{json}");
+        assert_eq!(ob_verify_end(), -1);
     }
 
     #[test]
