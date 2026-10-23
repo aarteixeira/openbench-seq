@@ -25,6 +25,11 @@ pub struct Feature {
     /// The parts of one feature share a group (written as "g<n>"), so a reader can join them again: a CDS in parts is
     /// translated across its parts, not part by part.
     pub group: Option<usize>,
+    /// A CDS's translation as its file states it: codon start 2 or 3, NCBI genetic code, and why it is not translated
+    /// ("pseudo", "exception"), as the GenBank reader gives them.
+    pub codon_start: Option<u8>,
+    pub table: Option<u8>,
+    pub untranslated: Option<&'static str>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -254,6 +259,50 @@ fn range(r: &str, n: usize, circular: bool) -> Option<(usize, usize)> {
     }
 }
 
+/// The NCBI genetic codes a CDS may name (as the page's NCBI_TABLES).
+const NCBI_TABLES: [u8; 27] = [1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14, 15, 16, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33];
+
+/// A CDS's translation from its feature tag and body, as GenBank states it (SnapGene keeps GenBank's qualifiers as
+/// `<Q name="..."><V int=".."/></Q>`): `codon_start`, `transl_table` (1 when absent), and the marks that refuse a
+/// translation (`pseudo`, `pseudogene`, `transl_except`, `exception`). SnapGene's own `readingFrame` (the sign is the
+/// strand) is refused, not guessed, when its frame is not 1 and `codon_start` does not state the same frame; so is a
+/// value that is not a number or a code this reader does not know.
+fn cds_translation(tag: &Tag, body: &str) -> Result<(Option<u8>, Option<u8>, Option<&'static str>), String> {
+    let (mut codon, mut table, mut refused) = (1u8, 1u8, None);
+    let mut q = body;
+    while let Some(j) = next_open(q, "Q")? {
+        q = &q[j..];
+        let (qt, end) = tag_of(q, "Q")?;
+        q = &q[end..];
+        let value = || -> Result<Option<i64>, String> {
+            let inner = if qt.closed { "" } else { &q[..q.find("</Q>").ok_or("an unterminated qualifier")?] };
+            match next_open(inner, "V")? {
+                Some(v) => tag_of(&inner[v..], "V")?.0.num("int", "a qualifier's value"),
+                None => Ok(None),
+            }
+        };
+        match qt.get("name").as_deref() {
+            Some("codon_start") => match value()? {
+                Some(c @ 1..=3) => codon = c as u8,
+                _ => refused = Some("exception"),
+            },
+            Some("transl_table") => match value()? {
+                Some(t) if NCBI_TABLES.contains(&(t as u8)) && (1..=33).contains(&t) => table = t as u8,
+                _ => refused = Some("exception"),
+            },
+            Some("pseudo" | "pseudogene") => refused = Some("pseudo"),
+            Some("transl_except" | "exception") => refused = refused.or(Some("exception")),
+            _ => {}
+        }
+    }
+    if let Some(rf) = tag.num("readingFrame", "a feature's reading frame")? {
+        if rf.abs() != 1 && rf.abs() != i64::from(codon) {
+            refused = refused.or(Some("exception"));
+        }
+    }
+    Ok(((codon > 1).then_some(codon), Some(table), refused))
+}
+
 /// `s` cut to `max` characters, counted in `cut` when it was longer.
 fn bounded(s: String, max: usize, cut: &mut usize) -> String {
     match s.char_indices().nth(max) {
@@ -329,6 +378,7 @@ fn features(xml: &str, n: usize, circular: bool, cut: &mut usize) -> Result<(Vec
         };
         let name = bounded(tag.get("name").unwrap_or_else(|| "feature".into()), 200, cut);
         let kind = bounded(tag.get("type").unwrap_or_else(|| "misc_feature".into()), 40, cut);
+        let (codon_start, table, untranslated) = if kind == "CDS" { cds_translation(&tag, body)? } else { (None, None, None) };
         // A piece round the whole circle is [0, n), except a CDS's that starts elsewhere: its reading starts there, so it
         // stays two parts, from its start to the end and from the origin back to its start (as the GenBank reader keeps it).
         let mut segments: Vec<(usize, usize, usize)> = segments
@@ -352,7 +402,7 @@ fn features(xml: &str, n: usize, circular: bool, cut: &mut usize) -> Result<(Vec
         for (i, (start, end, _)) in segments.into_iter().enumerate() {
             let k = i + 1;
             let name = if parts == 1 { name.clone() } else { format!("{name} (part {k} of {parts})") };
-            out.push(Feature { name, kind: kind.clone(), start, end, direction, color: color.clone(), group });
+            out.push(Feature { name, kind: kind.clone(), start, end, direction, color: color.clone(), group, codon_start, table, untranslated });
         }
     }
     Ok((out, skipped))
@@ -420,7 +470,7 @@ fn primers(xml: &str, n: usize, circular: bool, room: usize, cut: &mut usize) ->
                 return Err(too_many());
             }
             seen.insert((start, end, direction));
-            out.push(Feature { name: name.clone(), kind: "primer_bind".into(), start, end, direction, color: None, group: None });
+            out.push(Feature { name: name.clone(), kind: "primer_bind".into(), start, end, direction, color: None, group: None, codon_start: None, table: None, untranslated: None });
         }
         rest = &rest[body_end.max(close)..];
     }
@@ -449,6 +499,15 @@ pub fn to_json(d: &Dna) -> String {
         }
         if let Some(g) = f.group {
             s.push_str(&format!(",\"group\":\"g{g}\""));
+        }
+        if let Some(c) = f.codon_start {
+            s.push_str(&format!(",\"codonStart\":{c}"));
+        }
+        if let Some(t) = f.table {
+            s.push_str(&format!(",\"table\":{t}"));
+        }
+        if let Some(u) = f.untranslated {
+            s.push_str(&format!(",\"untranslated\":\"{u}\""));
         }
         s.push('}');
     }
@@ -742,4 +801,31 @@ mod tests {
         assert_eq!(parse(&f, 100_000).unwrap().features.len(), 40_000);
         assert!(t.elapsed().as_secs() < 2, "{:?}", t.elapsed());
     }
+    #[test]
+    fn a_cds_keeps_its_codon_start_and_code_and_is_refused_when_its_frame_is_not_stated() {
+        let cds = |attrs: &str, qs: &str| {
+            let xml = format!(r#"<Features><Feature name="c" type="CDS" directionality="1"{attrs}><Segment range="1-9"/>{qs}</Feature></Features>"#);
+            let f = &parse(&file(b"ATGAAATGACCCGTAA", 0, &xml), 100).unwrap().features[0];
+            (f.codon_start, f.table, f.untranslated)
+        };
+        let q = |name: &str, v: &str| format!(r#"<Q name="{name}"><V int="{v}"/></Q>"#);
+        // Stated as GenBank states them: codon start, genetic code (1 when absent).
+        assert_eq!(cds("", ""), (None, Some(1), None));
+        assert_eq!(cds("", &(q("codon_start", "2") + &q("transl_table", "11"))), (Some(2), Some(11), None));
+        // SnapGene's reading frame agrees with codon_start (its sign is the strand), or is refused, never guessed.
+        assert_eq!(cds(r#" readingFrame="-2""#, &q("codon_start", "2")), (Some(2), Some(1), None));
+        assert_eq!(cds(r#" readingFrame="-1""#, ""), (None, Some(1), None));
+        assert_eq!(cds(r#" readingFrame="3""#, ""), (None, Some(1), Some("exception")));
+        // Marks that refuse a translation, and values this reader cannot apply.
+        assert_eq!(cds("", r#"<Q name="pseudo"/>"#).2, Some("pseudo"));
+        assert_eq!(cds("", &q("transl_except", "1")).2, Some("exception"));
+        assert_eq!(cds("", &q("transl_table", "7")).2, Some("exception"));
+        assert_eq!(cds("", &q("codon_start", "4")).2, Some("exception"));
+        // Only a CDS carries them.
+        let gene = parse(&file(b"ATGAAATGA", 0, r#"<Features><Feature name="g" type="gene"><Segment range="1-9"/><Q name="codon_start"><V int="2"/></Q></Feature></Features>"#), 100).unwrap();
+        assert_eq!((gene.features[0].codon_start, gene.features[0].table), (None, None));
+        assert!(to_json(&parse(&file(b"ATGAAATGACCCGTAA", 0, r#"<Features><Feature name="c" type="CDS"><Segment range="1-9"/><Q name="codon_start"><V int="3"/></Q></Feature></Features>"#), 100).unwrap())
+            .contains(r#""codonStart":3,"table":1}"#));
+    }
+
 }
