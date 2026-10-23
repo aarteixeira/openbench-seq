@@ -7,7 +7,7 @@
 //! call may grow memory.
 //!
 //! No unsafe code: the only `unsafe` is the `#[unsafe(no_mangle)]` export attribute (Rust 2024), allowed on each
-//! export below and nowhere else.
+//! export below, and the declaration of the host's progress import (`ob_progress`, declared `safe`), and nowhere else.
 #![deny(unsafe_code)]
 
 pub mod abif;
@@ -21,6 +21,22 @@ pub mod translate;
 pub mod verify;
 
 use std::cell::RefCell;
+
+// The host's progress callback (`env.ob_progress`), declared safe: it takes two integers and returns nothing.
+#[cfg(target_arch = "wasm32")]
+#[link(wasm_import_module = "env")]
+#[allow(unsafe_code)]
+unsafe extern "C" {
+    safe fn ob_progress(done: u32, total: u32);
+}
+
+/// Tells the host how far a long calculation has got (`done` of `total`); nothing outside WebAssembly.
+pub fn progress(done: usize, total: usize) {
+    #[cfg(target_arch = "wasm32")]
+    ob_progress(done.min(u32::MAX as usize) as u32, total.min(u32::MAX as usize) as u32);
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = (done, total);
+}
 
 /// Largest input accepted in one slot: 10 Mb sequences (decision 7) and trace files fit well within it.
 pub const MAX_INPUT: usize = 64 << 20;
@@ -217,19 +233,21 @@ pub extern "C" fn ob_verify_begin(circular: u32, start: u32, end: u32, min_q: u3
     }
 }
 
-/// Add a read: bases in slot 0, Phred values in slot 1 (one per base) when `has_quality`, its name in slot 2.
+/// Add a read: bases in slot 0, Phred values in slot 1 (one per base) when `has_quality`, its name in slot 2; `closed`:
+/// a whole-plasmid consensus whose end joins its start. An alignment refused for its size is an error: the clone has no
+/// verdict.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ob_verify_add(has_quality: u32) -> i32 {
+pub extern "C" fn ob_verify_add(has_quality: u32, closed: u32) -> i32 {
     let (bases, quality, name) = (input(0), input(1), input(2));
     if has_quality != 0 && quality.len() != bases.len() {
         return fail(-1, "a read needs one quality value per base");
     }
     VERIFY.with(|v| match v.borrow_mut().as_mut() {
-        Some(j) => {
-            j.add(&String::from_utf8_lossy(&name), &bases, (has_quality != 0).then_some(&quality[..]));
-            0
-        }
+        Some(j) => match j.add(&String::from_utf8_lossy(&name), &bases, (has_quality != 0).then_some(&quality[..]), closed != 0) {
+            Ok(()) => 0,
+            Err(e) => fail(-1, e),
+        },
         None => fail(-1, "no verification was started"),
     })
 }
@@ -284,10 +302,10 @@ mod tests {
         put(0, &reference[5..115]);
         put(1, &[40u8; 110]);
         put(2, b"clone1_F");
-        assert_eq!(ob_verify_add(1), 0);
+        assert_eq!(ob_verify_add(1, 0), 0);
         assert!(ob_verify_end() > 0);
         let json = OUT_BYTES.with(|o| String::from_utf8(o.borrow().clone()).unwrap());
-        assert!(json.starts_with(r#"{"verdict":"pass","quality":true,"covered":100,"single":100,"differences":[]"#), "{json}");
+        assert!(json.starts_with(r#"{"verdict":"pass","quality":true,"covered":100,"single":100,"differenceTotal":0,"differences":[]"#), "{json}");
         assert_eq!(ob_verify_end(), -1);
     }
 

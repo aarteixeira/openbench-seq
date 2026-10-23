@@ -32,9 +32,10 @@ impl Scoring {
         if self.protein { blosum62(x, y) } else if same_base(x, y) { 2 } else { -3 }
     }
 
-    /// Whether two letters are the same for identity: bases by the IUPAC rule, residues by letter.
+    /// Whether two letters are identical (a match column; identity counts these): the same letter. Scoring is
+    /// separate: A against R scores as a match but is a mismatch column.
     pub fn same(&self, x: u8, y: u8) -> bool {
-        if self.protein { x.eq_ignore_ascii_case(&y) } else { same_base(x, y) }
+        x.eq_ignore_ascii_case(&y)
     }
 
     /// The score of `b` aligned to itself in full: the most any alignment of `b` can reach.
@@ -138,33 +139,55 @@ pub fn align(a: &[u8], b: &[u8], mode: Mode, sc: &Scoring, band: Option<(isize, 
     } else {
         let exact = fill(a, b, mode, sc, full, false)?;
         let (_, ie, je, _) = exact.end;
-        let mut span = m + m / 4 + 100;
+        // The traceback runs in a band of diagonals (pad each side) inside a window of a ending at the exact end, both
+        // doubled until it reaches the exact score.
+        let mut pad = 100 + (m / 20) as isize;
         loop {
             let (got, whole) = if mode == Mode::Global {
                 let (dlo, dhi) = diagonals(a, b, sc.protein).unwrap_or((0, 0));
-                let (pad, d) = (span as isize, m as isize - n as isize);
+                let d = m as isize - n as isize;
                 let (lo, hi) = ((dlo - pad).min(0).min(d), (dhi + pad).max(0).max(d));
                 (traced(a, b, mode, (lo, hi)), lo <= full.0 && hi >= full.1)
             } else {
-                // A window of a ending at the exact end, with b up to it. Overlap's free start in b holds only at a's
-                // start; inside a it is glocal.
-                let i0 = ie.saturating_sub(span);
+                // Overlap's free start in b holds only at a's start; inside a it is glocal.
+                let i0 = ie.saturating_sub(m + 2 * pad as usize);
                 let wmode = if mode == Mode::Overlap && i0 > 0 { Mode::Glocal } else { mode };
                 let (wa, wb) = (&a[i0..ie], &b[..je]);
-                let got = traced(wa, wb, wmode, (-(wa.len() as isize), wb.len() as isize)).map(|mut x| {
+                let end = wb.len() as isize - wa.len() as isize;
+                let (lo, hi) = (end - pad, end + pad);
+                let got = traced(wa, wb, wmode, (lo, hi)).map(|mut x| {
                     x.a = (x.a.0 + i0, x.a.1 + i0);
                     x
                 });
-                (got, i0 == 0)
+                (got, i0 == 0 && lo <= -(wa.len() as isize) && hi >= wb.len() as isize)
             };
             match got {
                 Ok(x) if x.score == exact.score => break Alignment { ties: exact.ties.clone(), ..x },
-                Ok(_) if !whole => span *= 2,
+                Ok(_) | Err(_) if !whole && got_fits(&got) => pad *= 2,
                 _ => return Err("too long to trace the alignment back within 100 million cells".into()),
             }
         }
     };
     Ok(right_gaps(a, b, sc, found))
+}
+
+/// The best score of aligning a and b and every end cell reaching it (none listed for local), from a score-only pass.
+pub fn best_ends(a: &[u8], b: &[u8], mode: Mode, sc: &Scoring) -> Result<(i32, Vec<(usize, usize)>), String> {
+    if (a.len() + 1).saturating_mul(b.len() + 1) > MAX_WORK {
+        return Err("too long to align: over 1 billion cells".into());
+    }
+    let f = fill(a, b, mode, sc, (-(a.len() as isize), b.len() as isize), false)?;
+    let mut ends = f.ties;
+    ends.push((f.end.1, f.end.2));
+    Ok((f.score, ends))
+}
+
+/// Whether a traceback attempt may be widened: it ran, or found no path in its band (not one refused for size).
+fn got_fits(got: &Result<Alignment, String>) -> bool {
+    match got {
+        Ok(_) => true,
+        Err(e) => e == "no alignment fits the band",
+    }
 }
 
 /// Every gap moved rightmost on a (3′ for DNA, C-terminal for protein): a gap shifts right past an aligned column while the letter it would give
@@ -284,107 +307,165 @@ fn fill(a: &[u8], b: &[u8], mode: Mode, sc: &Scoring, (lo, hi): (isize, isize), 
         }
         trace = vec![0u8; total];
     }
+    // Letters as codes once (DNA masks, protein matrix indexes), so a cell's score is a lookup.
+    let (ac, bc): (Vec<u8>, Vec<u8>) = if sc.protein {
+        (a.iter().map(|&x| index(x) as u8).collect(), b.iter().map(|&x| index(x) as u8).collect())
+    } else {
+        (a.iter().map(|&x| mask(x)).collect(), b.iter().map(|&x| mask(x)).collect())
+    };
+    let mx = matrix();
+    let pair = |x: u8, y: u8| -> i32 {
+        if sc.protein {
+            mx[x as usize][y as usize] as i32
+        } else if x != 0 && y != 0 && (x & !y == 0 || y & !x == 0) {
+            2
+        } else {
+            -3
+        }
+    };
+    // Score rows indexed by column; cells outside a row's range hold NEG (reset before a buffer is reused).
     let (mut hp, mut ep, mut fp) = (vec![NEG; m + 1], vec![NEG; m + 1], vec![NEG; m + 1]);
     let (mut hc, mut ec, mut fc) = (vec![NEG; m + 1], vec![NEG; m + 1], vec![NEG; m + 1]);
-    let mut prev: Option<(usize, usize)> = None;
+    // The range each buffer last held, to reset it.
+    let (mut held_p, mut held_c): (Option<(usize, usize)>, Option<(usize, usize)>) = (None, None);
     let mut ends: Vec<(i32, usize, usize, u8)> = Vec::new();
     let mut local = (NEG, 0usize, 0usize, 0u8);
     for i in 0..=n {
+        // Progress every 1,024 rows: a long alignment tells the page how far it has got.
+        if i % 1024 == 0 && n >= 4096 {
+            crate::progress(i, n);
+        }
+        if let Some((l, h)) = held_c.take() {
+            hc[l..=h].fill(NEG);
+            ec[l..=h].fill(NEG);
+            fc[l..=h].fill(NEG);
+        }
         let Some((jl, jh)) = row(i, lo, hi, m) else {
-            prev = None;
+            // An empty row: the next one reads nothing above it.
+            if let Some((l, h)) = held_p.take() {
+                hp[l..=h].fill(NEG);
+                ep[l..=h].fill(NEG);
+                fp[l..=h].fill(NEG);
+            }
             continue;
         };
-        let up = |v: &Vec<i32>, j: usize| match prev {
-            Some((l, h)) if j >= l && j <= h => v[j],
-            _ => NEG,
-        };
-        for j in jl..=jh {
-            let (mut h, mut e, mut f, mut t) = (NEG, NEG, NEG, 0u8);
-            if i == 0 && j == 0 {
-                h = 0;
-                t = START;
-            } else if i > 0 && j > 0 {
-                // H: a[i-1] against b[j-1].
-                let (ph, pe, pf) = (up(&hp, j - 1), up(&ep, j - 1), up(&fp, j - 1));
-                let (mut best, mut from) = (ph, 0u8);
-                if pe > best {
-                    (best, from) = (pe, 1);
-                }
-                if pf > best {
-                    (best, from) = (pf, 2);
-                }
-                if mode == Mode::Local && best < 0 {
-                    (best, from) = (0, START);
-                }
-                if best > NEG {
-                    h = best + sc.pair(a[i - 1], b[j - 1]);
-                    t = from;
-                }
-            } else if (j == 0 && mode != Mode::Global) || (i == 0 && mode == Mode::Overlap) {
-                // Glocal, overlap and local start anywhere along a; overlap also anywhere along b (its bases before a's
-                // first are not aligned).
-                h = 0;
-                t = START;
-            }
-            // E: b[j-1] against nothing (from the left).
-            if j > jl {
-                let (lh, le, lf) = (hc[j - 1], ec[j - 1], fc[j - 1]);
-                let ex = if le > NEG { le - ext } else { NEG };
-                let (op, from) = if lf > lh { (lf, 1u8) } else { (lh, 0u8) };
-                let op = if op > NEG { op - open } else { NEG };
-                if op >= ex && op > NEG {
-                    e = op;
-                    t |= 4 | (from << 3);
+        let (global, overlap, is_local) = (mode == Mode::Global, mode == Mode::Overlap, mode == Mode::Local);
+        let row_off = if keep { off[i] } else { 0 };
+        // The cell left of the next one: (H, E, F); none at the band's left edge.
+        let (mut lh, mut le, mut lf) = (NEG, NEG, NEG);
+        let mut j = jl;
+        if i == 0 || j == 0 {
+            // The first row, or the first column of this row: starts and end gaps (see the mode rules).
+            for jj in jl..=if i == 0 { jh } else { jl } {
+                let mut t = 0u8;
+                let h = if (i == 0 && jj == 0) || (jj == 0 && !global) || (i == 0 && overlap) {
+                    t = START;
+                    0
                 } else {
-                    e = ex;
-                }
-            }
-            // F: a[i-1] against nothing (from above). Before b starts (j = 0) only a global alignment pays for it.
-            if i > 0 && !(j == 0 && mode != Mode::Global) {
-                let (uh, ue, uf) = (up(&hp, j), up(&ep, j), up(&fp, j));
-                let ex = if uf > NEG { uf - ext } else { NEG };
-                let (op, from) = if ue > uh { (ue, 1u8) } else { (uh, 0u8) };
-                let op = if op > NEG { op - open } else { NEG };
-                if op >= ex && op > NEG {
-                    f = op;
-                    t |= 16 | (from << 5);
-                } else {
-                    f = ex;
-                }
-            }
-            (hc[j], ec[j], fc[j]) = (h, e, f);
-            if keep {
-                trace[off[i] + j - jl] = t;
-            }
-            let at_end = match mode {
-                Mode::Local => {
-                    if h > local.0 {
-                        local = (h, i, j, 0);
+                    NEG
+                };
+                // E: from the left (row 0 only: column 0 has no left).
+                let e = if jj > jl {
+                    let ex = le - ext;
+                    let (op, from) = if lf > lh { (lf, 1u8) } else { (lh, 0u8) };
+                    if op - open >= ex {
+                        t |= 4 | (from << 3);
+                        op - open
+                    } else {
+                        ex
                     }
-                    false
-                }
-                Mode::Glocal => j == m,
-                Mode::Overlap => j == m || i == n,
-                Mode::Global => i == n && j == m,
-            };
-            if at_end {
-                let (mut v, mut s) = (h, 0u8);
-                if e > v {
-                    (v, s) = (e, 1);
-                }
-                if f > v {
-                    (v, s) = (f, 2);
-                }
-                if v > NEG {
-                    ends.push((v, i, j, s));
+                } else {
+                    NEG
+                };
+                // F: from above, in column 0 of a global alignment only (before b starts the others pay nothing).
+                let f = if i > 0 && global {
+                    let (uh, ue, uf) = (hp[0], ep[0], fp[0]);
+                    let ex = uf - ext;
+                    let (op, from) = if ue > uh { (ue, 1u8) } else { (uh, 0u8) };
+                    if op - open >= ex {
+                        t |= 16 | (from << 5);
+                        op - open
+                    } else {
+                        ex
+                    }
+                } else {
+                    NEG
+                };
+                (hc[jj], ec[jj], fc[jj]) = (h, e, f);
+                (lh, le, lf) = (h, e, f);
+                if keep {
+                    trace[row_off + jj - jl] = t;
                 }
             }
+            j = if i == 0 { jh + 1 } else { jl + 1 };
         }
-        // Cells of this row outside the next row's reach are never read: `up` checks the range.
+        // Inner cells: scores below NEG / 2 are unreachable, so no cell checks for NEG before adding.
+        let ai = if i > 0 { ac[i - 1] } else { 0 };
+        while j <= jh {
+            let (ph, pe, pf) = (hp[j - 1], ep[j - 1], fp[j - 1]);
+            let (mut best, mut from) = (ph, 0u8);
+            if pe > best {
+                (best, from) = (pe, 1);
+            }
+            if pf > best {
+                (best, from) = (pf, 2);
+            }
+            if is_local && best < 0 {
+                (best, from) = (0, START);
+            }
+            let h = best + pair(ai, bc[j - 1]);
+            let mut t = from;
+            let ex = le - ext;
+            let (op, ef) = if lf > lh { (lf, 1u8) } else { (lh, 0u8) };
+            let e = if op - open >= ex {
+                t |= 4 | (ef << 3);
+                op - open
+            } else {
+                ex
+            };
+            let (uh, ue, uf) = (hp[j], ep[j], fp[j]);
+            let fx = uf - ext;
+            let (op, ff) = if ue > uh { (ue, 1u8) } else { (uh, 0u8) };
+            let f = if op - open >= fx {
+                t |= 16 | (ff << 5);
+                op - open
+            } else {
+                fx
+            };
+            (hc[j], ec[j], fc[j]) = (h, e, f);
+            (lh, le, lf) = (h, e, f);
+            if keep {
+                trace[row_off + j - jl] = t;
+            }
+            if is_local && h > local.0 {
+                local = (h, i, j, 0);
+            }
+            j += 1;
+        }
+        // Ends: glocal at b's end; overlap also anywhere on a's last row; global at both ends.
+        let mut end_at = |j: usize| {
+            let (h, e, f) = (hc[j], ec[j], fc[j]);
+            let (mut v, mut s) = (h, 0u8);
+            if e > v {
+                (v, s) = (e, 1);
+            }
+            if f > v {
+                (v, s) = (f, 2);
+            }
+            if v > NEG / 2 {
+                ends.push((v, i, j, s));
+            }
+        };
+        match mode {
+            Mode::Overlap if i == n => (jl..=jh).for_each(&mut end_at),
+            Mode::Glocal | Mode::Overlap if jh == m => end_at(m),
+            Mode::Global if i == n && jh == m => end_at(m),
+            _ => {}
+        }
         std::mem::swap(&mut hp, &mut hc);
         std::mem::swap(&mut ep, &mut ec);
         std::mem::swap(&mut fp, &mut fc);
-        prev = Some((jl, jh));
+        (held_c, held_p) = (held_p, Some((jl, jh)));
     }
     let end = if mode == Mode::Local {
         local
@@ -393,7 +474,7 @@ fn fill(a: &[u8], b: &[u8], mode: Mode, sc: &Scoring, (lo, hi): (isize, isize), 
         let best = ends.iter().map(|e| e.0).max().unwrap_or(NEG);
         *ends.iter().find(|e| e.0 == best).unwrap_or(&(NEG, 0, 0, 0))
     };
-    if end.0 <= NEG {
+    if end.0 <= NEG / 2 {
         return Err("no alignment fits the band".into());
     }
     let ties = ends.iter().filter(|e| e.0 == end.0 && (e.1, e.2) != (end.1, end.2)).map(|e| (e.1, e.2)).collect();
@@ -554,8 +635,9 @@ mod tests {
         assert_eq!(run("TTTTACGTACGTTTTT", "ACGTACG", Mode::Glocal), Alignment { score: 14, a: (4, 11), b: (0, 7), ops: vec![(Match, 7)], ties: vec![] });
         // Local: the best common stretch, ACGT (8), at 3-7 of a and 2-6 of b.
         assert_eq!(run("GGGACGTGGG", "TTACGTTT", Mode::Local), Alignment { score: 8, a: (3, 7), b: (2, 6), ops: vec![(Match, 4)], ties: vec![] });
-        // IUPAC: N in b matches any base of a.
-        assert_eq!(run("ACGTACGT", "ACNTACGT", Mode::Global).ops, vec![(Match, 8)]);
+        // IUPAC: N in b scores as a match against any base of a (16), as a mismatch column.
+        let x = run("ACGTACGT", "ACNTACGT", Mode::Global);
+        assert_eq!((x.score, x.ops), (16, vec![(Match, 2), (Mismatch, 1), (Match, 5)]));
     }
 
     #[test]
@@ -584,7 +666,8 @@ mod tests {
     #[test]
     fn iupac_scores_the_same_in_both_orders_and_gaps_go_3_prime() {
         let (x, y) = (run("ACGAACGT", "ACGRACGT", Mode::Global), run("ACGRACGT", "ACGAACGT", Mode::Global));
-        assert_eq!((x.score, y.score, x.ops.clone()), (16, 16, vec![(Match, 8)]));
+        // A against R scores as a match (2) but is not identical: a mismatch column, identity 7/8.
+        assert_eq!((x.score, y.score, x.ops.clone(), x.identity()), (16, 16, vec![(Match, 3), (Mismatch, 1), (Match, 4)], 0.875));
         // AAAA against AAA: the deletion is the last A, whichever A the traceback took.
         let d = run("CAAAAG", "CAAAG", Mode::Global);
         assert_eq!((d.score, d.ops.clone()), (10 - 7, vec![(Match, 4), (Del, 1), (Match, 1)]));
@@ -632,6 +715,10 @@ mod tests {
         b2[150_000..151_000].copy_from_slice(&copy);
         let y = align(&b2, &read, Mode::Glocal, &Scoring::DNA, None).unwrap();
         assert_eq!((y.a, y.ties), ((50_000, 51_000), vec![(151_000, 1000)]));
+        // A 12 kb consensus against itself (144 million cells): traced in a band inside the window, exactly.
+        let c = bases(12_000);
+        let w = align(&c, &c, Mode::Glocal, &Scoring::DNA, None).unwrap();
+        assert_eq!((w.a, w.score, w.ops), ((0, 12_000), 24_000, vec![(Match, 12_000)]));
         // Tandem copies in a short reference: every copy's end is a tie.
         let z = align(b"AACGAACGAACGAACGAACGAACG", b"AACGAACG", Mode::Glocal, &Scoring::DNA, None).unwrap();
         assert_eq!(z.ties.len(), 4);
