@@ -287,11 +287,13 @@ fn cds_translation(tag: &Tag, body: &str) -> Result<(Option<u8>, Option<u8>, Opt
             q = &q[close + 4..];
             inner
         };
-        // The qualifier's one number; none when it has none, two values or a value that is not a number.
+        // The qualifier's one number; none when it has none, two values, a value that is not a number or one not closed
+        // (self-closing, or ended by its own </V> before anything else).
         let value = || -> Result<Option<i64>, String> {
             let Some(v) = next_open(inner, "V")? else { return Ok(None) };
             let (vt, e) = tag_of(&inner[v..], "V")?;
-            if next_open(&inner[v + e..], "V")?.is_some() {
+            let rest = &inner[v + e + 1..];
+            if (!vt.closed && !rest.trim_start().starts_with("</V>")) || next_open(&inner[v + e..], "V")?.is_some() {
                 return Ok(None);
             }
             vt.num("int", "a qualifier's value")
@@ -871,6 +873,9 @@ mod tests {
         assert_eq!(cds("", &(q("codon_start", "2") + &q("codon_start", "1"))).2, Some("exception"));
         assert_eq!(cds("", &(q("codon_start", "2") + &q("codon_start", "2"))), (Some(2), Some(1), None));
         assert_eq!(cds("", r#"<Q name="codon_start"><V int="1"/><V int="2"/></Q>"#).2, Some("exception"));
+        // A value that is not closed is not read; one closed by its own </V> is.
+        assert_eq!(cds("", r#"<Q name="codon_start"><V int="2"></Q>"#).2, Some("exception"));
+        assert_eq!(cds("", r#"<Q name="codon_start"><V int="2"></V></Q>"#), (Some(2), Some(1), None));
         // Marks that refuse a translation, and values this reader cannot apply.
         assert_eq!(cds("", r#"<Q name="pseudo"/>"#).2, Some("pseudo"));
         assert_eq!(cds("", &q("transl_except", "1")).2, Some("exception"));
