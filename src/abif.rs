@@ -1,7 +1,7 @@
 //! ABIF (`.ab1`) Sanger trace files: "ABIF", a version, then a 28-byte root directory entry pointing at the
 //! directory. Each entry: name (4), number (i32), element type (i16), element size (i16), element count (i32),
 //! data size (i32), data offset (i32), handle (i32), big-endian; data of 4 bytes or fewer sits in the offset field.
-//! Read: base calls (PBAS 2, else 1), qualities (PCON 2, else 1), peak positions (PLOC 2, else 1), the four
+//! Read: base calls (PBAS 2, else 1), and the qualities (PCON) and peak positions (PLOC) of that same set only, the four
 //! channels (DATA 9-12, in the base order of FWO_ 1) and the sample name (SMPL 1).
 
 use crate::json;
@@ -66,7 +66,9 @@ pub fn parse(f: &[u8]) -> Result<Trace, String> {
     let entries: Vec<Entry> = (0..root.count).map(|i| entry(f, dir + 28 * i)).collect::<Result<_, _>>()?;
     let find = |name: &[u8; 4], numbers: &[i32]| numbers.iter().find_map(|&n| entries.iter().find(|e| &e.name == name && e.number == n));
 
+    // One call set: the basecaller's (2), else 1, with the qualities and peaks of that same set only.
     let bases = find(b"PBAS", &[2, 1]).ok_or("the file has no base calls")?;
+    let set = [bases.number];
     let bytes_of = |e: &Entry, what: &str| if e.elsize == 1 { Ok(()) } else { Err(format!("{what} have an unexpected element size")) };
     bytes_of(bases, "base calls")?;
     if bases.count > MAX_BASES {
@@ -78,11 +80,11 @@ pub fn parse(f: &[u8]) -> Result<Trace, String> {
     }
     // Qualities and peaks are per base call: present, they have one value per call (checked before anything is read).
     let per_base = |e: &Entry, what: &str| if e.count == bases.count { Ok(()) } else { Err(format!("{} {what} for {} base calls", e.count, bases.count)) };
-    let quality = match find(b"PCON", &[2, 1]) {
+    let quality = match find(b"PCON", &set) {
         Some(e) => { bytes_of(e, "qualities")?; per_base(e, "qualities")?; e.data[..e.count].to_vec() }
         None => vec![],
     };
-    let peaks: Vec<i32> = match find(b"PLOC", &[2, 1]) {
+    let peaks: Vec<i32> = match find(b"PLOC", &set) {
         Some(e) if e.elsize == 2 => { per_base(e, "peak positions")?; e.data[..2 * e.count].chunks_exact(2).map(|c| i16::from_be_bytes([c[0], c[1]]) as i32).collect() }
         Some(_) => return Err("peak positions have an unexpected element size".into()),
         None => vec![],
@@ -302,5 +304,12 @@ mod tests {
             let cut = if x & 1 == 0 { g.len() } else { (x >> 40) as usize % (g.len() + 1) };
             let _ = parse(&g[..cut]);
         }
+    }
+
+    #[test]
+    fn qualities_and_peaks_come_from_the_call_set_read() {
+        // Calls 2 without qualities 2: the qualities of set 1 (for other calls) are not attached to them.
+        let r = parse(&abif(&[(b"PBAS", 1, 2, 1, b"TTTT"), (b"PBAS", 2, 2, 1, b"AAAA"), (b"PCON", 1, 2, 1, &[40, 40, 40, 40])])).unwrap();
+        assert_eq!((r.bases.as_str(), r.quality.len()), ("AAAA", 0));
     }
 }

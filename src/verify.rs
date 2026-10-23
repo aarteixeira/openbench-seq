@@ -86,6 +86,8 @@ pub struct ReadResult {
     /// complemented on the reverse strand) its operations start, and the operations (unaligned ends left out).
     pub ref_start: usize,
     pub read_start: usize,
+    /// For a joined closed read: where in the read (as aligned) its alignment starts, the read taken as a circle.
+    pub rotation: usize,
     pub ops: Vec<(Op, u32)>,
     pub score: i32,
     pub identity: f64,
@@ -159,7 +161,7 @@ impl Job {
             return Err(format!("a clone takes at most {MAX_READS} reads"));
         }
         let n = self.reference.len();
-        let mut r = ReadResult { name: name.to_string(), placed: false, ambiguous: false, reason: String::new(), strand: 1, used: (0, bases.len()), ref_start: 0, read_start: 0, ops: Vec::new(), score: 0, identity: 0.0 };
+        let mut r = ReadResult { name: name.to_string(), placed: false, ambiguous: false, reason: String::new(), strand: 1, used: (0, bases.len()), ref_start: 0, read_start: 0, rotation: 0, ops: Vec::new(), score: 0, identity: 0.0 };
         if let Some(q) = quality {
             self.any_quality = true;
             r.used = align::trim(q, self.limit);
@@ -192,7 +194,7 @@ impl Job {
         let best = if tries[1].1.score > tries[0].1.score { 1 } else { 0 };
         let (strand, mut a) = tries[best].clone();
         let other = &tries[1 - best].1;
-        let read: &[u8] = if strand == 1 { &fwd } else { &rev };
+        let mut read: Vec<u8> = if strand == 1 { fwd.clone() } else { rev.clone() };
         r.strand = strand;
         r.score = a.score;
         r.identity = a.identity();
@@ -202,12 +204,10 @@ impl Job {
             self.reads.push(r);
             return Ok(());
         }
-        // Another placement as good: positions one turn apart are one placement. The other strand as good is another
-        // reading of the evidence unless the read is its own reverse complement over the same span (the same bases).
+        // Another placement as good: positions one turn apart are one placement. The other strand as good is always
+        // another reading (a read that is its own reverse complement carries its qualities differently on each).
         let key = |i: usize| if self.circular { i % n } else { i };
-        let span = |x: &align::Alignment| (key(x.a.0), key(x.a.1));
-        let palindrome = fwd == rev && span(other) == span(&a);
-        let mut ambiguous = other.score >= a.score && !palindrome;
+        let mut ambiguous = other.score >= a.score;
         ambiguous |= a.ties.iter().any(|&(i, j)| (key(i), j) != (key(a.a.1), a.b.1));
         if !ambiguous {
             // Other starts reaching the same end: the ends of the reversed alignment.
@@ -222,31 +222,54 @@ impl Job {
             self.reads.push(r);
             return Ok(());
         }
-        // A read past one turn that is not closed (a concatemer, overlapping ends) is no evidence. A closed read (a
-        // whole-plasmid consensus) is the circle: it is aligned again end to end against one turn of the reference,
-        // rotated to where it was placed, so a difference where its ends meet (a deletion, an insertion) is seen too.
-        if self.circular && a.a.1 - a.a.0 > n && !closed {
+        // Qualities in the read's aligned order (reversed with the bases on the reverse strand).
+        let mut q: Option<Vec<u8>> = quality.map(|q| {
+            let q = q[s..e].to_vec();
+            if strand == 1 { q } else { q.into_iter().rev().collect() }
+        });
+        // A closed read is a circle only when trimming kept both of its ends; otherwise it is read as an open one.
+        let joined = closed && self.circular && r.used == (0, bases.len());
+        // A read past one turn that is not joined (a concatemer, overlapping ends) is no evidence.
+        if self.circular && a.a.1 - a.a.0 > n && !joined {
             self.matched_unused += 1;
             r.reason = "it covers the circle more than once".into();
             self.reads.push(r);
             return Ok(());
         }
-        if self.circular && closed {
-            let s = a.a.0 % n;
+        if joined {
+            // End to end against one turn rotated to its placement, then again from a seam no gap can reach, so a
+            // difference where its ends meet is seen and every gap takes its rightmost place inside the alignment.
+            let s0 = a.a.0 % n;
+            let turn: Vec<u8> = [&self.reference[s0..], &self.reference[..s0]].concat();
+            let g = align::align(&turn, &read, Mode::Global, &sc, None)?;
+            let Some((s, k)) = seam(&self.reference, s0, &g, &read) else {
+                self.matched_unused += 1;
+                r.reason = "its ends can't be joined unambiguously".into();
+                self.reads.push(r);
+                return Ok(());
+            };
             let turn: Vec<u8> = [&self.reference[s..], &self.reference[..s]].concat();
-            let mut g = align::align(&turn, read, Mode::Global, &sc, None)?;
-            g.a = (g.a.0 + s, g.a.1 + s);
+            read.rotate_left(k);
+            if let Some(q) = q.as_mut() {
+                q.rotate_left(k);
+            }
+            let mut g = align::align(&turn, &read, Mode::Global, &sc, None)?;
+            let gap = |o: Option<&(Op, u32)>| matches!(o, Some((Op::Ins | Op::Del, _)));
+            if gap(g.ops.first()) || gap(g.ops.last()) {
+                self.matched_unused += 1;
+                r.reason = "its ends can't be joined unambiguously".into();
+                self.reads.push(r);
+                return Ok(());
+            }
+            g.a = (s, s + n);
             a = g;
+            r.rotation = k;
             r.identity = a.identity();
         }
+        let read: &[u8] = &read;
         r.placed = true;
         r.ref_start = a.a.0 % n;
         r.read_start = a.b.0;
-        // Qualities in the read's aligned order (reversed with the bases on the reverse strand).
-        let q: Option<Vec<u8>> = quality.map(|q| {
-            let q = q[s..e].to_vec();
-            if strand == 1 { q } else { q.into_iter().rev().collect() }
-        });
         let qual = |j: usize| -> u8 { q.as_ref().map_or(0, |q| q[j]) };
         let strong = |p: u8| q.is_some() && p >= self.min_q;
         let at = self.reads.len();
@@ -259,9 +282,8 @@ impl Job {
             Obs { read: at, allele: ins, q: q.as_ref().map(|_| around), call, strong: call && strong(around) }
         };
         let (mut i, mut j) = (a.a.0, a.b.0);
-        // A closed read whose ends trimming kept is a circle: past its last base comes its first, before its first its
-        // last (the flanks of a deletion where its ends meet).
-        let joined = closed && self.circular && r.used == (0, bases.len());
+        // A joined read is a circle: past its last base comes its first, before its first its last (the flanks of a
+        // deletion where its ends meet).
         // The bases inserted since the last aligned reference position, and their lowest Phred.
         let mut pending: Option<(String, u8)> = None;
         // The last reference position, the last read base aligned to one, the first such read base, and the bases
@@ -309,7 +331,6 @@ impl Job {
         }
         // A closed read covering the circle once joins its end to its start: the junction between its last position
         // and its first holds what it has after the one and before the other.
-        // Only when trimming kept both of the read's ends: otherwise its trimmed ends never met.
         if let (true, Some(prev)) = (joined, last) {
             let (tail, tq) = pending.take().unwrap_or((String::new(), u8::MAX));
             let (head, hq) = lead.take().unwrap_or((String::new(), u8::MAX));
@@ -432,6 +453,67 @@ impl Job {
     }
 }
 
+/// Columns of matches a seam needs on each side.
+const SEAM_MATCHES: usize = 20;
+
+/// Where a joined closed read's turn can start: a reference position s (and the read index aligned there) with
+/// SEAM_MATCHES identical columns on each side in `g` (`read` aligned end to end against the turn starting at `s0`),
+/// that no gap of `g` can move across by the rightmost rule (each gap's equivalent places are found around the
+/// circle). The one nearest the middle of the alignment; None when there is none.
+fn seam(reference: &[u8], s0: usize, g: &align::Alignment, read: &[u8]) -> Option<(usize, usize)> {
+    let n = reference.len() as isize;
+    let at = |p: isize| reference[p.rem_euclid(n) as usize];
+    // Columns: (reference offset in the turn, read index, identical), and the seams each gap could reach: [lo, hi].
+    let (mut i, mut j) = (0isize, 0usize);
+    let mut cols: Vec<(isize, usize, bool)> = Vec::new();
+    let mut blocked: Vec<(isize, isize)> = Vec::new();
+    for &(op, c) in &g.ops {
+        let (p, l) = (s0 as isize + i, c as isize);
+        match op {
+            Op::Del => {
+                // Deleted [p, p + l): it may move while the bases it trades are equal.
+                let (mut left, mut right) = (0, 0);
+                while left < n && at(p - 1 - left) == at(p + l - 1 - left) { left += 1; }
+                while right < n && at(p + right) == at(p + l + right) { right += 1; }
+                blocked.push((p - left, p + l + right));
+            }
+            Op::Ins => {
+                // Inserted between p - 1 and p: it may move while the base it passes equals its letter at that end.
+                let x = &read[j..j + c as usize];
+                let (mut left, mut right) = (0isize, 0isize);
+                while left < n && at(p - 1 - left) == x[(l - 1 - left % l) as usize] { left += 1; }
+                while right < n && at(p + right) == x[(right % l) as usize] { right += 1; }
+                blocked.push((p - left, p + right));
+            }
+            _ => {}
+        }
+        for _ in 0..c {
+            cols.push((i, j, op == Op::Match));
+            match op {
+                Op::Match | Op::Mismatch => { i += 1; j += 1; }
+                Op::Del => i += 1,
+                Op::Ins => j += 1,
+            }
+        }
+    }
+    let m = cols.len();
+    if m < 2 * SEAM_MATCHES {
+        return None;
+    }
+    let safe = |s: isize| blocked.iter().all(|&(lo, hi)| hi - lo < n && (s - lo).rem_euclid(n) > hi - lo);
+    // Candidates from the middle outward; the alignment is a circle, so its columns wrap.
+    for d in 0..m {
+        let c = (m / 2 + if d % 2 == 0 { d / 2 } else { m - (d + 1) / 2 }) % m;
+        let ok = (0..2 * SEAM_MATCHES).all(|t| cols[(c + m - SEAM_MATCHES + t) % m].2);
+        let (off, k, _) = cols[c];
+        let s = s0 as isize + off;
+        if ok && safe(s) {
+            return Some((s.rem_euclid(n) as usize, k));
+        }
+    }
+    None
+}
+
 /// Runs of consecutive positions (in the order given) as first and last.
 fn runs(positions: impl Iterator<Item = usize>) -> Vec<(usize, usize)> {
     let mut out: Vec<(usize, usize)> = Vec::new();
@@ -484,6 +566,8 @@ pub fn to_json(job: &Job, rep: &Report) -> String {
     pairs(&mut o, &runs(rep.unsupported.iter().copied()));
     o.push_str(&format!(",\"conflictTotal\":{},\"conflictRuns\":", rep.conflicts.len()));
     pairs(&mut o, &runs(rep.conflicts.iter().filter(|c| !c.junction).map(|c| c.pos)));
+    o.push_str(",\"junctionConflictRuns\":");
+    pairs(&mut o, &runs(rep.conflicts.iter().filter(|c| c.junction).map(|c| c.pos)));
     o.push_str(",\"conflicts\":[");
     for (k, c) in rep.conflicts.iter().take(MAX_LISTED).enumerate() {
         if k > 0 {
@@ -509,7 +593,7 @@ pub fn to_json(job: &Job, rep: &Report) -> String {
         json::string(&mut o, &r.name);
         o.push_str(&format!(",\"placed\":{},\"ambiguous\":{},\"reason\":", r.placed, r.ambiguous));
         json::string(&mut o, &r.reason);
-        o.push_str(&format!(",\"strand\":{},\"used\":[{},{}],\"refStart\":{},\"readStart\":{},\"score\":{},\"identity\":{:.4},\"ops\":", r.strand, r.used.0, r.used.1, r.ref_start, r.read_start, r.score, r.identity));
+        o.push_str(&format!(",\"strand\":{},\"used\":[{},{}],\"refStart\":{},\"readStart\":{},\"rotation\":{},\"score\":{},\"identity\":{:.4},\"ops\":", r.strand, r.used.0, r.used.1, r.ref_start, r.read_start, r.rotation, r.score, r.identity));
         json::numbers(&mut o, r.ops.iter().flat_map(|&(op, n)| [op as u32, n]));
         o.push('}');
     }
@@ -719,13 +803,12 @@ mod tests {
         let mut j = job(&tandem, (200, 500));
         j.add("f", &[&unit[..], &unit[..]].concat(), Some(&q(120, 40)), false).unwrap();
         assert_eq!((j.reads()[0].ambiguous, j.report().verdict), (true, "incomplete"));
-        // A closed consensus holding the plasmid twice: one turn, then a whole copy inserted where it closes.
+        // A closed consensus holding the plasmid twice: the extra copy could sit anywhere on the circle, so the read's
+        // ends can't be joined unambiguously: no evidence, and the clone is incomplete (not failed).
         let r = bases(300, 30);
         let mut j = Job::new(&r, true, (0, 300), 20, 0.05).unwrap();
         j.add("twice", &[&r[..], &r[..]].concat(), None, true).unwrap();
-        let rep = j.report();
-        assert_eq!((j.reads()[0].placed, rep.verdict), (true, "mutation (no quality data)"));
-        assert!(matches!(&rep.differences[..], [Diff::Ins { bases, .. }] if bases.len() == 300), "{:?}", rep.differences);
+        assert_eq!((j.reads()[0].placed, j.reads()[0].reason.as_str(), j.report().verdict), (false, "its ends can't be joined unambiguously", "incomplete"));
         // The plasmid once, closed, unrotated and rotated: one placement (not a tie with its copy one turn on), and
         // the junction where it closes is observed.
         for read in [r.clone(), [&r[100..], &r[..100]].concat()] {
@@ -797,6 +880,40 @@ mod tests {
     }
 
     #[test]
+    fn a_closed_consensus_gives_the_same_calls_from_any_origin_and_a_trimmed_one_is_open() {
+        // A 300-base circle with 120 As across its origin (60 each side); the consensus lacks one A. Read from three
+        // origins (one inside the A run), it gives one deletion at the run's last A and no conflict.
+        let mut r = vec![b'A'; 60];
+        r.extend(bases(180, 47));
+        r.extend([b'A'; 60]);
+        let lacking: Vec<u8> = r[1..].to_vec(); // the same circle less one A, read from position 1
+        let mut last = 59; // the run's last A (the flank after it may begin with A too)
+        while r[last + 1] == b'A' {
+            last += 1;
+        }
+        for k in [0, 30, 150] {
+            let read: Vec<u8> = [&lacking[k..], &lacking[..k]].concat();
+            let mut j = Job::new(&r, true, (0, 300), 20, 0.05).unwrap();
+            j.add("c", &read, None, true).unwrap();
+            assert_eq!(j.report().differences, vec![Diff::Del { positions: vec![last] }], "origin {k}");
+        }
+        // Two rotations together: the same calls, so no conflict.
+        let mut j = Job::new(&r, true, (0, 300), 20, 0.05).unwrap();
+        for k in [0, 150] {
+            j.add("c", &[&lacking[k..], &lacking[..k]].concat(), None, true).unwrap();
+        }
+        assert_eq!((j.report().verdict, j.report().conflicts.len()), ("mutation (no quality data)", 0));
+        // A closed read that lost an end to trimming is open: its ends never meet, so the junction there is not seen.
+        let r = bases(300, 48);
+        let read = [&r[..], b"G"].concat();
+        let mut qual = q(read.len(), 40);
+        qual[300] = 5;
+        let mut j = Job::new(&r, true, (250, 50), 20, 0.05).unwrap();
+        j.add("c", &read, Some(&qual), true).unwrap();
+        assert_eq!((j.report().verdict, j.report().unsupported), ("incomplete", vec![299]));
+    }
+
+    #[test]
     fn the_closing_junction_of_a_whole_circle_is_checked() {
         // Reads covering every position and every inner junction, one with GG inserted after the last base.
         let r = bases(300, 31);
@@ -809,7 +926,7 @@ mod tests {
     }
 
     #[test]
-    fn different_starts_to_one_end_are_ambiguous_and_a_palindrome_is_one_placement() {
+    fn different_starts_to_one_end_and_a_palindrome_are_ambiguous() {
         // ACGTAAGCCA then 60 Ts, and ACGTA then 60 Ts: the read fits from 0 (a 5-base deletion) or from 5 equally.
         let mut r = b"ACGTAAGCCA".to_vec();
         r.extend([b'T'; 60]);
@@ -819,13 +936,16 @@ mod tests {
         let mut j = job(&r, (0, 65));
         j.add("f", &read, None, false).unwrap();
         assert!(j.reads()[0].ambiguous, "{}", j.reads()[0].reason);
-        // A read equal to its own reverse complement matches both strands over one span: placed.
+        // A read equal to its own reverse complement matches both strands as well: its qualities sit differently on the
+        // two readings, so it is ambiguous (here a Q15 base would pass on one reading and not the other).
         let half = bases(60, 33);
         let pal = [&half[..], &rc(&half)].concat();
         let ref2 = [&bases(150, 34)[..], &pal, &bases(150, 35)].concat();
+        let mut qual = q(120, 40);
+        qual[10] = 15;
         let mut j = job(&ref2, (150, 270));
-        j.add("p", &pal, Some(&q(120, 40)), false).unwrap();
-        assert_eq!((j.reads()[0].placed, j.report().verdict), (true, "pass"));
+        j.add("p", &pal, Some(&qual), false).unwrap();
+        assert_eq!((j.reads()[0].ambiguous, j.report().verdict), (true, "incomplete"));
     }
 
     #[test]
