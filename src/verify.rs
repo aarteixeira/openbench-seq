@@ -10,9 +10,10 @@
 //! reversed alignment); positions one turn apart are one placement. An alignment refused for its size refuses the
 //! whole clone (`add` returns the reason): no verdict rests on a calculation that was not made.
 //!
-//! On a circle a read covers at most one turn: columns past it are read as bases inserted after its last position. A
-//! read the caller marks closed (a whole-plasmid consensus) and that covers exactly one turn joins its end to its
-//! start, so it also observes the junction there.
+//! On a circle a read gives evidence for one turn at most. A read the caller marks closed (a whole-plasmid consensus)
+//! joins its end to its start: covering exactly one turn it also observes the junction there, and longer, its columns
+//! past the turn are bases inserted after the turn's last position. Any other read past a turn (a concatemer,
+//! overlapping ends) observes the junction at the turn and nothing after it.
 //!
 //! Observations: per reference position a base or a deletion; per junction between two consecutive positions a read
 //! spans, what it inserts there (possibly nothing). Quality: a base's Phred; a deletion's, the lower Phred of the read
@@ -217,8 +218,12 @@ impl Job {
             self.reads.push(r);
             return Ok(());
         }
-        // At most one turn of a circle: columns past it are bases inserted after the turn's last position.
-        if self.circular && a.a.1 - a.a.0 > n {
+        // At most one turn of a circle. A closed read (a whole-plasmid consensus) longer than a turn holds more than the
+        // reference: its columns past the turn are bases inserted after the turn's last position. Any other read past
+        // a turn is reading the same molecule again (a concatemer, overlapping ends): it observes the junction at the
+        // turn and nothing after (below).
+        let past_turn = self.circular && a.a.1 - a.a.0 > n;
+        if past_turn && closed {
             let mut ops: Vec<(Op, u32)> = Vec::new();
             let mut taken = 0usize;
             let mut push = |o: Op, c: u32| match ops.last_mut() {
@@ -263,11 +268,21 @@ impl Job {
         // The last reference position, the last read base aligned to one, the first such read base, and the bases
         // before the first position.
         let (mut last, mut left, mut first, mut lead): (Option<usize>, Option<usize>, Option<usize>, Option<(String, u8)>) = (None, None, None, None);
-        for &(op, c) in &a.ops {
+        let mut taken = 0usize;
+        'columns: for &(op, c) in &a.ops {
             for _ in 0..c {
                 match op {
                     Op::Match | Op::Mismatch | Op::Del => {
                         let pos = i % n;
+                        // A read past a turn (not closed): the junction at the turn, then nothing more.
+                        if taken == n {
+                            if let Some(prev) = last {
+                                let (ins, iq) = pending.take().unwrap_or((String::new(), u8::MAX));
+                                self.after.entry(prev).or_default().push(junction(ins, iq, left, (j < read.len()).then_some(j)));
+                            }
+                            break 'columns;
+                        }
+                        taken += 1;
                         // The read base after the junction: this one, or for a deletion the next one the read has.
                         let right = (j < read.len()).then_some(j);
                         match last {
@@ -729,6 +744,21 @@ mod tests {
         let mut j = job(&r, (50, 250));
         j.add("f", &r[..300], Some(&q(300, 0)), false).unwrap();
         assert_eq!(j.report().verdict, "incomplete");
+    }
+
+    #[test]
+    fn a_read_past_one_turn_that_is_not_closed_adds_nothing_after_the_turn() {
+        // A linear read of a 300-base circle running 1.2 turns (a concatemer): evidence for one turn and the junction at
+        // the turn, no insertion; the closed reading of the same bases is a 360-base molecule, a 60-base insertion.
+        let r = bases(300, 40);
+        let read = [&r[..], &r[..60]].concat();
+        let mut j = Job::new(&r, true, (0, 300), 20, 0.05).unwrap();
+        j.add("raw", &read, Some(&q(read.len(), 40)), false).unwrap();
+        let rep = j.report();
+        assert_eq!((rep.verdict, rep.differences.len(), rep.unsupported.len()), ("pass", 0, 0));
+        let mut j = Job::new(&r, true, (0, 300), 20, 0.05).unwrap();
+        j.add("consensus", &read, Some(&q(read.len(), 40)), true).unwrap();
+        assert!(matches!(&j.report().differences[..], [Diff::Ins { bases, .. }] if bases.len() == 60));
     }
 
     #[test]

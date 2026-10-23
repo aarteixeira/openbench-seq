@@ -125,19 +125,19 @@ const NEG: i32 = i32::MIN / 4;
 pub fn align(a: &[u8], b: &[u8], mode: Mode, sc: &Scoring, band: Option<(isize, isize)>) -> Result<Alignment, String> {
     let (n, m) = (a.len(), b.len());
     let full = (-(n as isize), m as isize);
-    let traced = |a: &[u8], b: &[u8], mode: Mode, band: (isize, isize)| -> Result<Alignment, String> {
-        let f = fill(a, b, mode, sc, band, true)?;
+    let traced = |a: &[u8], b: &[u8], mode: Mode, band: (isize, isize), report: bool| -> Result<Alignment, String> {
+        let f = fill(a, b, mode, sc, band, true, report)?;
         Ok(traceback(a, b, sc, &f))
     };
     let cells = (n + 1).saturating_mul(m + 1);
     let found = if let Some(band) = band {
-        traced(a, b, mode, band)?
+        traced(a, b, mode, band, true)?
     } else if cells <= TRACE_CELLS {
-        traced(a, b, mode, full)?
+        traced(a, b, mode, full, true)?
     } else if cells > MAX_WORK {
         return Err("too long to align: over 1 billion cells".into());
     } else {
-        let exact = fill(a, b, mode, sc, full, false)?;
+        let exact = fill(a, b, mode, sc, full, false, true)?;
         let (_, ie, je, _) = exact.end;
         // The traceback runs in a band of diagonals (pad each side) inside a window of a ending at the exact end, both
         // doubled until it reaches the exact score.
@@ -147,7 +147,7 @@ pub fn align(a: &[u8], b: &[u8], mode: Mode, sc: &Scoring, band: Option<(isize, 
                 let (dlo, dhi) = diagonals(a, b, sc.protein).unwrap_or((0, 0));
                 let d = m as isize - n as isize;
                 let (lo, hi) = ((dlo - pad).min(0).min(d), (dhi + pad).max(0).max(d));
-                (traced(a, b, mode, (lo, hi)), lo <= full.0 && hi >= full.1)
+                (traced(a, b, mode, (lo, hi), false), lo <= full.0 && hi >= full.1)
             } else {
                 // Overlap's free start in b holds only at a's start; inside a it is glocal.
                 let i0 = ie.saturating_sub(m + 2 * pad as usize);
@@ -155,7 +155,7 @@ pub fn align(a: &[u8], b: &[u8], mode: Mode, sc: &Scoring, band: Option<(isize, 
                 let (wa, wb) = (&a[i0..ie], &b[..je]);
                 let end = wb.len() as isize - wa.len() as isize;
                 let (lo, hi) = (end - pad, end + pad);
-                let got = traced(wa, wb, wmode, (lo, hi)).map(|mut x| {
+                let got = traced(wa, wb, wmode, (lo, hi), false).map(|mut x| {
                     x.a = (x.a.0 + i0, x.a.1 + i0);
                     x
                 });
@@ -176,7 +176,7 @@ pub fn best_ends(a: &[u8], b: &[u8], mode: Mode, sc: &Scoring) -> Result<(i32, V
     if (a.len() + 1).saturating_mul(b.len() + 1) > MAX_WORK {
         return Err("too long to align: over 1 billion cells".into());
     }
-    let f = fill(a, b, mode, sc, (-(a.len() as isize), b.len() as isize), false)?;
+    let f = fill(a, b, mode, sc, (-(a.len() as isize), b.len() as isize), false, true)?;
     let mut ends = f.ties;
     ends.push((f.end.1, f.end.2));
     Ok((f.score, ends))
@@ -289,7 +289,8 @@ fn row(i: usize, lo: isize, hi: isize, m: usize) -> Option<(usize, usize)> {
     (h >= l).then_some((l as usize, h as usize))
 }
 
-fn fill(a: &[u8], b: &[u8], mode: Mode, sc: &Scoring, (lo, hi): (isize, isize), keep: bool) -> Result<Filled, String> {
+/// `report`: tell the host how far the fill has got, every 2^20 cells (only the pass over the whole input reports).
+fn fill(a: &[u8], b: &[u8], mode: Mode, sc: &Scoring, (lo, hi): (isize, isize), keep: bool, report: bool) -> Result<Filled, String> {
     let (n, m) = (a.len(), b.len());
     let (open, ext) = (sc.open + sc.extend, sc.extend);
     let mut off = Vec::new();
@@ -330,10 +331,13 @@ fn fill(a: &[u8], b: &[u8], mode: Mode, sc: &Scoring, (lo, hi): (isize, isize), 
     let (mut held_p, mut held_c): (Option<(usize, usize)>, Option<(usize, usize)>) = (None, None);
     let mut ends: Vec<(i32, usize, usize, u8)> = Vec::new();
     let mut local = (NEG, 0usize, 0usize, 0u8);
+    // Cells filled so far, of about `total`, and when progress was last told.
+    let total = (n + 1).saturating_mul((hi - lo + 1).max(0) as usize).min((n + 1).saturating_mul(m + 1));
+    let (mut cells, mut told) = (0usize, 0usize);
     for i in 0..=n {
-        // Progress every 1,024 rows: a long alignment tells the page how far it has got.
-        if i % 1024 == 0 && n >= 4096 {
-            crate::progress(i, n);
+        if report && cells - told >= 1 << 20 {
+            crate::progress(cells, total);
+            told = cells;
         }
         if let Some((l, h)) = held_c.take() {
             hc[l..=h].fill(NEG);
@@ -349,6 +353,7 @@ fn fill(a: &[u8], b: &[u8], mode: Mode, sc: &Scoring, (lo, hi): (isize, isize), 
             }
             continue;
         };
+        cells += jh - jl + 1;
         let (global, overlap, is_local) = (mode == Mode::Global, mode == Mode::Overlap, mode == Mode::Local);
         let row_off = if keep { off[i] } else { 0 };
         // The cell left of the next one: (H, E, F); none at the band's left edge.
