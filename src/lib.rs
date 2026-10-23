@@ -287,7 +287,7 @@ mod tests {
         assert_eq!(ob_verify_add(1), 0);
         assert!(ob_verify_end() > 0);
         let json = OUT_BYTES.with(|o| String::from_utf8(o.borrow().clone()).unwrap());
-        assert!(json.starts_with(r#"{"verdict":"pass","quality":true,"differences":[]"#), "{json}");
+        assert!(json.starts_with(r#"{"verdict":"pass","quality":true,"covered":100,"single":100,"differences":[]"#), "{json}");
         assert_eq!(ob_verify_end(), -1);
     }
 
