@@ -15,6 +15,8 @@ pub mod align;
 pub mod alphabet;
 mod json;
 pub mod search;
+pub mod msa;
+pub mod similar;
 pub mod sites;
 pub mod snapgene;
 pub mod translate;
@@ -215,6 +217,59 @@ pub extern "C" fn ob_trim(limit_milli: u32) -> i32 {
     ints(vec![s as i32, e as i32])
 }
 
+/// Align the sequences in slot 0 (one per line) progressively; `protein` picks the scoring. Bytes: the aligned rows, one
+/// per line, in input order (gaps `-`).
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn ob_msa(protein: u32) -> i32 {
+    let text = input(0);
+    let seqs: Vec<Vec<u8>> = text.split(|&b| b == b'\n').map(|l| l.to_vec()).collect();
+    match msa::msa(&seqs, protein != 0) {
+        Ok(rows) => bytes(rows.join(&b'\n')),
+        Err(e) => fail(-1, e),
+    }
+}
+
+/// Screen the candidate in slot 0 for the query in slot 1's k-mers. Ints: query k-mers, shared, expected × 1000,
+/// window start, window length, strand.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn ob_screen(protein: u32, circular: u32) -> i32 {
+    let (subject, query) = (input(0), input(1));
+    let s = similar::screen(&query, &subject, protein != 0, circular != 0);
+    let clip = |v: usize| v.min(i32::MAX as usize) as i32;
+    ints(vec![clip(s.query_kmers), clip(s.shared), (s.expected * 1000.0).min(i32::MAX as f64) as i32, clip(s.window.0), clip(s.window.1), s.strand as i32])
+}
+
+/// Where the oligo in slot 1 (5′→3′, its binding part) binds the template in slot 0: the qualifying count (counting stops
+/// at `stop_at`), then (position, strand, mismatch bits low, mismatch bits high) for at most `keep` sites.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn ob_bind(circular: u32, keep: u32, stop_at: u32) -> i32 {
+    let (seq, oligo) = (input(0), input(1));
+    match search::bind(&seq, &oligo, circular != 0, keep.min(100) as usize, stop_at.max(1) as usize) {
+        Ok((count, sites)) => {
+            let mut out = vec![count.min(i32::MAX as usize) as i32];
+            out.extend(sites.iter().flat_map(|s| [s.pos as i32, s.strand as i32, s.mismatches as u32 as i32, (s.mismatches >> 32) as u32 as i32]));
+            ints(out)
+        }
+        Err(e) => fail(-1, format!("{e:?}")),
+    }
+}
+
+/// The best window of the record in slot 0 within `k` substitutions of the query in slot 1 with at least `min_identical`
+/// identical letters. Ints: none, or position, strand, score, identical letters.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn ob_best_hit(k: u32, protein: u32, circular: u32, min_identical: u32) -> i32 {
+    let (seq, query) = (input(0), input(1));
+    match search::best_hit(&seq, &query, k as usize, protein != 0, circular != 0, min_identical as usize) {
+        Ok(Some(b)) => ints(vec![b.pos as i32, b.strand as i32, b.score, b.identical as i32]),
+        Ok(None) => ints(vec![]),
+        Err(e) => fail(-1, format!("{e:?}")),
+    }
+}
+
 thread_local! {
     static VERIFY: RefCell<Option<verify::Job>> = const { RefCell::new(None) };
 }
@@ -307,6 +362,29 @@ mod tests {
         let json = OUT_BYTES.with(|o| String::from_utf8(o.borrow().clone()).unwrap());
         assert!(json.starts_with(r#"{"verdict":"pass","quality":true,"covered":100,"single":100,"differenceTotal":0,"differences":[]"#), "{json}");
         assert_eq!(ob_verify_end(), -1);
+    }
+
+    #[test]
+    fn aligns_screens_binds_and_finds_through_the_abi() {
+        put(0, b"ACGTTGCA\nACGTATGCA");
+        assert_eq!(ob_msa(0), 19);
+        assert_eq!(OUT_BYTES.with(|o| o.borrow().clone()), b"ACGT-TGCA\nACGTATGCA");
+        put(0, b"ACGT");
+        assert_eq!(ob_msa(0), -1);
+        let q = b"ACGTTGCAAGCTTCGAGGATCCTTAAGCGCATATGCCGAT";
+        let subject = [&[b'T'; 50][..], q, &[b'T'; 50][..]].concat();
+        put(0, &subject);
+        put(1, q);
+        assert_eq!(ob_screen(0, 0), 6);
+        assert_eq!(OUT_I32.with(|o| o.borrow().clone())[..2], [25, 25]);
+        put(0, &subject);
+        put(1, &q[..16]);
+        assert_eq!(ob_bind(0, 10, 2), 5);
+        assert_eq!(OUT_I32.with(|o| o.borrow().clone()), vec![1, 50, 1, 0, 0]);
+        put(0, &subject);
+        put(1, &q[..20]);
+        assert_eq!(ob_best_hit(3, 0, 0, 12), 4);
+        assert_eq!(OUT_I32.with(|o| o.borrow().clone()), vec![50, 1, 40, 20]);
     }
 
     #[test]
