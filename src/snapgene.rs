@@ -264,46 +264,62 @@ const NCBI_TABLES: [u8; 27] = [1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14, 15, 16, 
 
 /// A CDS's translation from its feature tag and body, as GenBank states it (SnapGene keeps GenBank's qualifiers as
 /// `<Q name="..."><V int=".."/></Q>`): `codon_start`, `transl_table` (1 when absent), and the marks that refuse a
-/// translation (`pseudo`, `pseudogene`, `transl_except`, `exception`). SnapGene's own `readingFrame` (the sign is the
-/// strand) is refused, not guessed, when its frame is not 1 and `codon_start` does not state the same frame; so is a
-/// value that is not a number or a code this reader does not know.
+/// translation (`pseudo`, `pseudogene`, `transl_except`, `exception`). Each qualifier is read once, up to its own
+/// `</Q>`; a qualifier inside another is a damaged file (re-reading nested bodies would make the reader quadratic). A
+/// value this reader cannot apply refuses the translation, never guessed: one that is not a number or a known code, two
+/// values in one qualifier, or a qualifier repeated with another value. So does SnapGene's own `readingFrame` when its
+/// size is not the codon start or its sign (the strand) is not the feature's stated strand.
 fn cds_translation(tag: &Tag, body: &str) -> Result<(Option<u8>, Option<u8>, Option<&'static str>), String> {
-    let (mut codon, mut table, mut refused) = (1u8, 1u8, None);
+    let (mut codon, mut table, mut refused) = (None::<u8>, None::<u8>, None);
     let mut q = body;
     while let Some(j) = next_open(q, "Q")? {
         q = &q[j..];
         let (qt, end) = tag_of(q, "Q")?;
         q = &q[end..];
-        let value = || -> Result<Option<i64>, String> {
-            let inner = if qt.closed { "" } else { &q[..q.find("</Q>").ok_or("an unterminated qualifier")?] };
-            match next_open(inner, "V")? {
-                Some(v) => tag_of(&inner[v..], "V")?.0.num("int", "a qualifier's value"),
-                None => Ok(None),
+        let inner = if qt.closed {
+            ""
+        } else {
+            let close = q.find("</Q>").ok_or("an unterminated qualifier")?;
+            let inner = &q[..close];
+            if next_open(inner, "Q")?.is_some() {
+                return Err("a qualifier inside a qualifier".into());
             }
+            q = &q[close + 4..];
+            inner
+        };
+        // The qualifier's one number; none when it has none, two values or a value that is not a number.
+        let value = || -> Result<Option<i64>, String> {
+            let Some(v) = next_open(inner, "V")? else { return Ok(None) };
+            let (vt, e) = tag_of(&inner[v..], "V")?;
+            if next_open(&inner[v + e..], "V")?.is_some() {
+                return Ok(None);
+            }
+            vt.num("int", "a qualifier's value")
+        };
+        // A value stated twice must be the same value.
+        let mut state = |slot: &mut Option<u8>, v: Option<u8>| match (v, *slot) {
+            (Some(v), None) => *slot = Some(v),
+            (Some(v), Some(was)) if v == was => {}
+            _ => refused = Some("exception"),
         };
         match qt.get("name").as_deref() {
-            Some("codon_start") => match value()? {
-                Some(c @ 1..=3) => codon = c as u8,
-                _ => refused = Some("exception"),
-            },
-            Some("transl_table") => match value()? {
-                Some(t) if NCBI_TABLES.contains(&(t as u8)) && (1..=33).contains(&t) => table = t as u8,
-                _ => refused = Some("exception"),
-            },
+            Some("codon_start") => state(&mut codon, value()?.filter(|c| (1..=3).contains(c)).map(|c| c as u8)),
+            Some("transl_table") => state(&mut table, value()?.filter(|t| (1..=33).contains(t) && NCBI_TABLES.contains(&(*t as u8))).map(|t| t as u8)),
             Some("pseudo" | "pseudogene") => refused = Some("pseudo"),
             Some("transl_except" | "exception") => refused = refused.or(Some("exception")),
             _ => {}
         }
     }
-    // SnapGene's reading frame: its size is the frame (1 or the codon start), its sign the strand, which must be the
-    // feature's own when the feature states one (directionality 1 forward, 2 reverse).
+    let (codon, table) = (codon.unwrap_or(1), table.unwrap_or(1));
+    // SnapGene's reading frame: its size is the frame, which must be the codon start, and its sign the strand, which
+    // must be the feature's own when the feature states one (directionality 1 forward, 2 reverse).
     if let Some(rf) = tag.num("readingFrame", "a feature's reading frame")? {
         let strand = match tag.get("directionality").as_deref() {
             Some("1") => 1,
             Some("2") => -1,
             _ => 0,
         };
-        if (rf.abs() != 1 && rf.abs() != i64::from(codon)) || (strand != 0 && rf.signum() != strand) {
+        if rf.abs() != i64::from(codon) || (strand != 0 && rf.signum() != strand) {
             refused = refused.or(Some("exception"));
         }
     }
@@ -637,6 +653,23 @@ mod tests {
     }
 
     #[test]
+    fn qualifiers_are_read_once_and_one_inside_another_is_refused() {
+        // Many qualifiers one after another: each read once, in linear time.
+        let qs = r#"<Q name="note"><V text="x"/></Q>"#.repeat(40_000) + r#"<Q name="codon_start"><V int="2"/></Q>"#;
+        let xml = format!(r#"<Features><Feature name="c" type="CDS" directionality="1"><Segment range="1-9"/>{qs}</Feature></Features>"#);
+        let t = std::time::Instant::now();
+        let d = parse(&file(b"ATGAAATGA", 0, &xml), 100).unwrap();
+        assert_eq!(d.features[0].codon_start, Some(2));
+        assert!(t.elapsed().as_secs() < 2, "{:?}", t.elapsed());
+        // Nested qualifiers (whose bodies a reader could scan again and again) are a damaged file.
+        let nested = format!(r#"<Features><Feature name="c" type="CDS"><Segment range="1-9"/>{}<V int="2"/>{}</Feature></Features>"#,
+            r#"<Q name="codon_start">"#.repeat(16_000), "</Q>".repeat(16_000));
+        let t = std::time::Instant::now();
+        assert_eq!(parse(&file(b"ATGAAATGA", 0, &nested), 100).err().as_deref(), Some("a qualifier inside a qualifier"));
+        assert!(t.elapsed().as_millis() < 500, "{:?}", t.elapsed());
+    }
+
+    #[test]
     fn linear_without_features() {
         let mut f = cookie(1);
         f.extend(packet(0x00, b"\x00ACGT"));
@@ -830,6 +863,14 @@ mod tests {
         // A frame on the other strand than the feature states.
         assert_eq!(cds(r#" readingFrame="-2""#, &q("codon_start", "2")), (Some(2), Some(1), Some("exception")));
         assert_eq!(cds_on("2", r#" readingFrame="1""#, "").2, Some("exception"));
+        // A frame of another size than the codon start (1 included).
+        assert_eq!(cds(r#" readingFrame="1""#, &q("codon_start", "3")).2, Some("exception"));
+        // A value stated twice must agree, whatever the order; two values in one qualifier are not picked from.
+        assert_eq!(cds("", &(q("transl_table", "1") + &q("transl_table", "2"))).2, Some("exception"));
+        assert_eq!(cds("", &(q("transl_table", "2") + &q("transl_table", "1"))).2, Some("exception"));
+        assert_eq!(cds("", &(q("codon_start", "2") + &q("codon_start", "1"))).2, Some("exception"));
+        assert_eq!(cds("", &(q("codon_start", "2") + &q("codon_start", "2"))), (Some(2), Some(1), None));
+        assert_eq!(cds("", r#"<Q name="codon_start"><V int="1"/><V int="2"/></Q>"#).2, Some("exception"));
         // Marks that refuse a translation, and values this reader cannot apply.
         assert_eq!(cds("", r#"<Q name="pseudo"/>"#).2, Some("pseudo"));
         assert_eq!(cds("", &q("transl_except", "1")).2, Some("exception"));
