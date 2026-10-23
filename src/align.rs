@@ -484,6 +484,10 @@ fn fill(a: &[u8], b: &[u8], mode: Mode, sc: &Scoring, (lo, hi): (isize, isize), 
         return Err("no alignment fits the band".into());
     }
     let ties = ends.iter().filter(|e| e.0 == end.0 && (e.1, e.2) != (end.1, end.2)).map(|e| (e.1, e.2)).collect();
+    // A reporting pass ends at 1, however few cells it had, so the host can tell one pass from the next.
+    if report {
+        crate::progress(total, total);
+    }
     Ok(Filled { lo, hi, score: end.0, end, ties, trace, off })
 }
 
