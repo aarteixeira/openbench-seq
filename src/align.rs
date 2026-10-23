@@ -330,7 +330,8 @@ fn fill(a: &[u8], b: &[u8], mode: Mode, sc: &Scoring, (lo, hi): (isize, isize), 
     // The range each buffer last held, to reset it.
     let (mut held_p, mut held_c): (Option<(usize, usize)>, Option<(usize, usize)>) = (None, None);
     let mut ends: Vec<(i32, usize, usize, u8)> = Vec::new();
-    let mut local = (NEG, 0usize, 0usize, 0u8);
+    // A local alignment's best starts as the empty one (score 0) at the first cell.
+    let mut local = (0, 0usize, 0usize, 0u8);
     // Cells filled so far, of about `total`, and when progress was last told.
     let total = (n + 1).saturating_mul((hi - lo + 1).max(0) as usize).min((n + 1).saturating_mul(m + 1));
     let (mut cells, mut told) = (0usize, 0usize);
@@ -736,6 +737,12 @@ mod tests {
         assert_eq!((x.score, x.a, x.b, x.ops.clone()), (20, (0, 10), (3, 13), vec![(Match, 10)]));
         // Inside a, overlap is glocal.
         assert_eq!(run("TTTTACGTACGTTTTT", "ACGTACG", Mode::Overlap), run("TTTTACGTACGTTTTT", "ACGTACG", Mode::Glocal));
+    }
+
+    #[test]
+    fn local_with_nothing_in_common_is_empty() {
+        assert_eq!(run("A", "C", Mode::Local), Alignment { score: 0, a: (0, 0), b: (0, 0), ops: vec![], ties: vec![] });
+        assert_eq!(run("", "ACGT", Mode::Local).score, 0);
     }
 
     #[test]

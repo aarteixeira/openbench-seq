@@ -10,10 +10,9 @@
 //! reversed alignment); positions one turn apart are one placement. An alignment refused for its size refuses the
 //! whole clone (`add` returns the reason): no verdict rests on a calculation that was not made.
 //!
-//! On a circle a read gives evidence for one turn at most. A read the caller marks closed (a whole-plasmid consensus)
-//! joins its end to its start: covering exactly one turn it also observes the junction there, and longer, its columns
-//! past the turn are bases inserted after the turn's last position. Any other read past a turn (a concatemer,
-//! overlapping ends) observes the junction at the turn and nothing after it.
+//! On a circle a read gives evidence for one turn at most: a read past a turn is no evidence unless the caller marks
+//! it closed (a whole-plasmid consensus). A closed read is aligned again end to end against one turn of the reference
+//! rotated to its placement, and its end joins its start (when trimming kept both), so it observes every junction.
 //!
 //! Observations: per reference position a base or a deletion; per junction between two consecutive positions a read
 //! spans, what it inserts there (possibly nothing). Quality: a base's Phred; a deletion's, the lower Phred of the read
@@ -52,8 +51,10 @@ pub struct Job {
     min_q: u8,
     limit: f64,
     any_quality: bool,
-    /// Reads with at least MIN_BASES after trimming.
+    /// Reads with at least MIN_BASES after trimming, and those that match the reference but give no evidence (past one
+    /// turn of a circle, not closed).
     usable: usize,
+    matched_unused: usize,
     reads: Vec<ReadResult>,
     /// Per reference position: what each placed read shows there (a base letter or '-').
     bases: BTreeMap<usize, Vec<Obs<u8>>>,
@@ -147,7 +148,7 @@ impl Job {
         } else {
             return Err("on a linear reference the region's end comes after its start".into());
         };
-        Ok(Job { reference: reference.to_ascii_uppercase(), circular, region, min_q, limit, any_quality: false, usable: 0, reads: Vec::new(), bases: BTreeMap::new(), after: BTreeMap::new() })
+        Ok(Job { reference: reference.to_ascii_uppercase(), circular, region, min_q, limit, any_quality: false, usable: 0, matched_unused: 0, reads: Vec::new(), bases: BTreeMap::new(), after: BTreeMap::new() })
     }
 
     /// Trim, place and read one read; a placed read's observations join the evidence. `closed`: the read is a
@@ -174,9 +175,10 @@ impl Job {
         let fwd: Vec<u8> = bases[s..e].iter().map(|&b| { let b = b.to_ascii_uppercase(); if is_base(b) { b } else { b'N' } }).collect();
         let rev: Vec<u8> = fwd.iter().rev().map(|&b| letter(complement(mask(b)))).collect();
         let len = fwd.len();
-        // On a circle the reference repeated past one turn and a half of the read (a deletion across the origin fits).
+        // On a circle the reference repeated to one turn plus twice the read (a read's span is under twice its length at
+        // the placement score, so every qualifying placement, a deletion across the origin included, fits).
         let ext: Vec<u8> = if self.circular {
-            let want = n + len + len / 2 + 100;
+            let want = n + 2 * len + 100;
             self.reference.iter().copied().cycle().take(want.max(n)).collect()
         } else {
             self.reference.clone()
@@ -200,10 +202,12 @@ impl Job {
             self.reads.push(r);
             return Ok(());
         }
-        // Another placement as good: positions one turn apart are one placement.
+        // Another placement as good: positions one turn apart are one placement. The other strand as good is another
+        // reading of the evidence unless the read is its own reverse complement over the same span (the same bases).
         let key = |i: usize| if self.circular { i % n } else { i };
         let span = |x: &align::Alignment| (key(x.a.0), key(x.a.1));
-        let mut ambiguous = other.score >= a.score && span(other) != span(&a);
+        let palindrome = fwd == rev && span(other) == span(&a);
+        let mut ambiguous = other.score >= a.score && !palindrome;
         ambiguous |= a.ties.iter().any(|&(i, j)| (key(i), j) != (key(a.a.1), a.b.1));
         if !ambiguous {
             // Other starts reaching the same end: the ends of the reversed alignment.
@@ -218,30 +222,22 @@ impl Job {
             self.reads.push(r);
             return Ok(());
         }
-        // At most one turn of a circle. A closed read (a whole-plasmid consensus) longer than a turn holds more than the
-        // reference: its columns past the turn are bases inserted after the turn's last position. Any other read past
-        // a turn is reading the same molecule again (a concatemer, overlapping ends): it observes the junction at the
-        // turn and nothing after (below).
-        let past_turn = self.circular && a.a.1 - a.a.0 > n;
-        if past_turn && closed {
-            let mut ops: Vec<(Op, u32)> = Vec::new();
-            let mut taken = 0usize;
-            let mut push = |o: Op, c: u32| match ops.last_mut() {
-                Some((p, k)) if *p == o => *k += c,
-                _ => ops.push((o, c)),
-            };
-            for &(op, c) in &a.ops {
-                for _ in 0..c {
-                    match op {
-                        Op::Match | Op::Mismatch if taken < n => { push(op, 1); taken += 1; }
-                        Op::Del if taken < n => { push(op, 1); taken += 1; }
-                        Op::Del => {}
-                        _ => push(Op::Ins, 1),
-                    }
-                }
-            }
-            a.ops = ops;
-            a.a.1 = a.a.0 + n;
+        // A read past one turn that is not closed (a concatemer, overlapping ends) is no evidence. A closed read (a
+        // whole-plasmid consensus) is the circle: it is aligned again end to end against one turn of the reference,
+        // rotated to where it was placed, so a difference where its ends meet (a deletion, an insertion) is seen too.
+        if self.circular && a.a.1 - a.a.0 > n && !closed {
+            self.matched_unused += 1;
+            r.reason = "it covers the circle more than once".into();
+            self.reads.push(r);
+            return Ok(());
+        }
+        if self.circular && closed {
+            let s = a.a.0 % n;
+            let turn: Vec<u8> = [&self.reference[s..], &self.reference[..s]].concat();
+            let mut g = align::align(&turn, read, Mode::Global, &sc, None)?;
+            g.a = (g.a.0 + s, g.a.1 + s);
+            a = g;
+            r.identity = a.identity();
         }
         r.placed = true;
         r.ref_start = a.a.0 % n;
@@ -263,39 +259,35 @@ impl Job {
             Obs { read: at, allele: ins, q: q.as_ref().map(|_| around), call, strong: call && strong(around) }
         };
         let (mut i, mut j) = (a.a.0, a.b.0);
+        // A closed read whose ends trimming kept is a circle: past its last base comes its first, before its first its
+        // last (the flanks of a deletion where its ends meet).
+        let joined = closed && self.circular && r.used == (0, bases.len());
         // The bases inserted since the last aligned reference position, and their lowest Phred.
         let mut pending: Option<(String, u8)> = None;
         // The last reference position, the last read base aligned to one, the first such read base, and the bases
         // before the first position.
         let (mut last, mut left, mut first, mut lead): (Option<usize>, Option<usize>, Option<usize>, Option<(String, u8)>) = (None, None, None, None);
-        let mut taken = 0usize;
-        'columns: for &(op, c) in &a.ops {
+        for &(op, c) in &a.ops {
             for _ in 0..c {
                 match op {
                     Op::Match | Op::Mismatch | Op::Del => {
                         let pos = i % n;
-                        // A read past a turn (not closed): the junction at the turn, then nothing more.
-                        if taken == n {
-                            if let Some(prev) = last {
-                                let (ins, iq) = pending.take().unwrap_or((String::new(), u8::MAX));
-                                self.after.entry(prev).or_default().push(junction(ins, iq, left, (j < read.len()).then_some(j)));
-                            }
-                            break 'columns;
-                        }
-                        taken += 1;
                         // The read base after the junction: this one, or for a deletion the next one the read has.
-                        let right = (j < read.len()).then_some(j);
+                        let right = if j < read.len() { Some(j) } else { joined.then_some(0) };
+                        let before = if left.is_none() && joined { Some(read.len() - 1) } else { left };
                         match last {
                             None => lead = pending.take(),
                             Some(prev) => {
                                 let (ins, iq) = pending.take().unwrap_or((String::new(), u8::MAX));
-                                self.after.entry(prev).or_default().push(junction(ins, iq, left, right));
+                                self.after.entry(prev).or_default().push(junction(ins, iq, before, right));
                             }
                         }
                         if op == Op::Del {
-                            let around = [left, right].into_iter().flatten().map(qual).fold(u8::MAX, u8::min);
+                            // A deletion is a call only between two called bases of the read.
+                            let call = matches!((before, right), (Some(l), Some(r)) if is_base(read[l]) && is_base(read[r]));
+                            let around = [before, right].into_iter().flatten().map(qual).fold(u8::MAX, u8::min);
                             let around = if q.is_some() { around } else { 0 };
-                            self.bases.entry(pos).or_default().push(Obs { read: at, allele: b'-', q: q.as_ref().map(|_| around), call: true, strong: strong(around) });
+                            self.bases.entry(pos).or_default().push(Obs { read: at, allele: b'-', q: q.as_ref().map(|_| around), call, strong: call && strong(around) });
                         } else {
                             let call = is_base(read[j]);
                             self.bases.entry(pos).or_default().push(Obs { read: at, allele: read[j], q: q.as_ref().map(|_| qual(j)), call, strong: call && strong(qual(j)) });
@@ -317,7 +309,8 @@ impl Job {
         }
         // A closed read covering the circle once joins its end to its start: the junction between its last position
         // and its first holds what it has after the one and before the other.
-        if let (true, Some(prev)) = (closed && self.circular && a.a.1 - a.a.0 == n, last) {
+        // Only when trimming kept both of the read's ends: otherwise its trimmed ends never met.
+        if let (true, Some(prev)) = (joined, last) {
             let (tail, tq) = pending.take().unwrap_or((String::new(), u8::MAX));
             let (head, hq) = lead.take().unwrap_or((String::new(), u8::MAX));
             self.after.entry(prev).or_default().push(junction(tail + &head, tq.min(hq), left, first));
@@ -336,33 +329,33 @@ impl Job {
         let quality = self.any_quality;
         // Without qualities anywhere, every call qualifies.
         let qualifies = |call: bool, strong: bool| if quality { strong } else { call };
-        // A position's call: Some(allele) when its calls agree and one qualifies.
+        // A position's call, and a junction's (after a position): Some when the calls agree and one qualifies.
         let call_at = |pos: usize| -> Option<u8> {
             let obs = self.bases.get(&pos)?;
             let calls: Vec<u8> = obs.iter().filter(|o| o.call).map(|o| o.allele).collect();
             (calls.iter().all(|&b| b == calls[0]) && obs.iter().any(|o| qualifies(o.call, o.strong))).then(|| calls[0])
         };
-        let mut differences = Vec::new();
+        let junction_at = |pos: usize| -> Option<&String> {
+            let obs = self.after.get(&pos)?;
+            let calls: Vec<&String> = obs.iter().filter(|o| o.call).map(|o| &o.allele).collect();
+            (calls.iter().all(|s| *s == calls[0]) && obs.iter().any(|o| qualifies(o.call, o.strong))).then(|| calls[0])
+        };
         let (mut uncovered, mut conflicts, mut unsupported): (Vec<Vec<usize>>, Vec<Conflict>, Vec<usize>) = (Vec::new(), Vec::new(), Vec::new());
         let (mut covered, mut single) = (0usize, 0usize);
-        let mut deleted: Vec<usize> = Vec::new();
-        let flush = |deleted: &mut Vec<usize>, differences: &mut Vec<Diff>| {
-            if !deleted.is_empty() {
-                differences.push(Diff::Del { positions: std::mem::take(deleted) });
-            }
-        };
         let whole = self.circular && self.region.len() == n;
+        // Region membership, and each position's place in the region (the order differences are listed in).
+        let mut place = vec![usize::MAX; n];
+        for (t, &pos) in self.region.iter().enumerate() {
+            place[pos] = t;
+        }
         for (t, &pos) in self.region.iter().enumerate() {
             let obs = self.bases.get(&pos).map(|v| &v[..]).unwrap_or(&[]);
-            let reference = self.reference[pos];
             let calls: Vec<u8> = obs.iter().filter(|o| o.call).map(|o| o.allele).collect();
             let good = obs.iter().filter(|o| qualifies(o.call, o.strong)).count();
             if calls.iter().any(|&b| b != calls[0]) {
-                flush(&mut deleted, &mut differences);
                 let calls = obs.iter().filter(|o| o.call).map(|o| (o.read, (o.allele as char).to_string(), o.q)).collect();
                 conflicts.push(Conflict { pos, junction: false, calls });
-            } else if good == 0 || !is_base(reference) {
-                flush(&mut deleted, &mut differences);
+            } else if good == 0 || !is_base(self.reference[pos]) {
                 match uncovered.last_mut() {
                     Some(run) if t > 0 && run.last() == Some(&self.region[t - 1]) => run.push(pos),
                     _ => uncovered.push(vec![pos]),
@@ -370,56 +363,60 @@ impl Job {
             } else {
                 covered += 1;
                 single += (good == 1) as usize;
-                let b = calls[0];
-                if b == b'-' {
-                    // A deletion at the region's start is reported from its first deleted position outside.
-                    if t == 0 && deleted.is_empty() && !whole {
-                        let mut p = pos;
-                        let mut back = Vec::new();
-                        while let Some(prev) = if p > 0 { Some(p - 1) } else if self.circular { Some(n - 1) } else { None } {
-                            if call_at(prev) != Some(b'-') || back.len() >= n { break; }
-                            back.push(prev);
-                            p = prev;
-                        }
-                        deleted.extend(back.into_iter().rev());
-                    }
-                    deleted.push(pos);
-                } else {
-                    flush(&mut deleted, &mut differences);
-                    if b != reference {
-                        differences.push(Diff::Sub { pos, reference, read: b });
-                    }
-                }
             }
             // The junction after this base: when the next region base follows it, and the closing one of a whole circle.
             if t + 1 < self.region.len() || whole {
                 let obs = self.after.get(&pos).map(|v| &v[..]).unwrap_or(&[]);
                 let calls: Vec<&String> = obs.iter().filter(|o| o.call).map(|o| &o.allele).collect();
                 if calls.iter().any(|s| *s != calls[0]) {
-                    flush(&mut deleted, &mut differences);
                     let calls = obs.iter().filter(|o| o.call).map(|o| (o.read, o.allele.clone(), o.q)).collect();
                     conflicts.push(Conflict { pos, junction: true, calls });
                 } else if !obs.iter().any(|o| qualifies(o.call, o.strong)) {
                     unsupported.push(pos);
-                } else if !calls[0].is_empty() {
-                    flush(&mut deleted, &mut differences);
-                    differences.push(Diff::Ins { after: pos, bases: calls[0].to_string() });
                 }
             }
         }
-        // A deletion reaching the region's end goes on through the deleted positions after it.
-        if !deleted.is_empty() && !whole {
-            let mut p = *deleted.last().unwrap();
-            while let Some(next) = if p + 1 < n { Some(p + 1) } else if self.circular { Some(0) } else { None } {
-                if call_at(next) != Some(b'-') || deleted.len() >= n { break; }
-                deleted.push(next);
-                p = next;
+        // Differences are built once over the whole reference from the agreed calls (a deletion is one event however
+        // the region cuts it, across the origin of a circle too), then kept when they touch the region.
+        let mut differences: Vec<(usize, Diff)> = Vec::new();
+        let positions: Vec<usize> = self.bases.keys().copied().collect();
+        let mut runs: Vec<Vec<usize>> = Vec::new();
+        for &pos in &positions {
+            let reference = self.reference[pos];
+            match call_at(pos) {
+                Some(b'-') => match runs.last_mut() {
+                    Some(run) if *run.last().unwrap() + 1 == pos => run.push(pos),
+                    _ => runs.push(vec![pos]),
+                },
+                Some(b) if is_base(reference) && b != reference && place[pos] != usize::MAX => differences.push((place[pos], Diff::Sub { pos, reference, read: b })),
+                _ => {}
             }
         }
-        flush(&mut deleted, &mut differences);
+        // On a circle a run ending at the last base and one starting at the first are one deletion.
+        if self.circular && runs.len() > 1 && runs[0][0] == 0 && *runs.last().unwrap().last().unwrap() == n - 1 {
+            let head = runs.remove(0);
+            runs.last_mut().unwrap().extend(head);
+        }
+        for run in runs {
+            if let Some(first) = run.iter().map(|&p| place[p]).filter(|&t| t != usize::MAX).min() {
+                differences.push((first, Diff::Del { positions: run }));
+            }
+        }
+        for (&pos, _) in &self.after {
+            let next = (pos + 1) % n;
+            let inside = place[pos] != usize::MAX && place[next] != usize::MAX && (place[next] == place[pos] + 1 || (whole && next == self.region[0]));
+            if let (true, Some(bases)) = (inside, junction_at(pos)) {
+                if !bases.is_empty() {
+                    differences.push((place[pos], Diff::Ins { after: pos, bases: bases.clone() }));
+                }
+            }
+        }
+        // In region order; at one place a deletion or substitution before the insertion after it.
+        differences.sort_by_key(|(t, d)| (*t, matches!(d, Diff::Ins { .. })));
+        let differences: Vec<Diff> = differences.into_iter().map(|(_, d)| d).collect();
         // Failed only on usable evidence: a clone whose reads all match more than one place, or have too few good
         // bases to judge, is incomplete.
-        let matched = self.reads.iter().any(|r| r.placed || r.ambiguous);
+        let matched = self.matched_unused > 0 || self.reads.iter().any(|r| r.placed || r.ambiguous);
         let verdict = if !matched && self.usable > 0 {
             "fail"
         } else if !uncovered.is_empty() || !conflicts.is_empty() || !unsupported.is_empty() || self.usable == 0 {
@@ -747,18 +744,56 @@ mod tests {
     }
 
     #[test]
-    fn a_read_past_one_turn_that_is_not_closed_adds_nothing_after_the_turn() {
-        // A linear read of a 300-base circle running 1.2 turns (a concatemer): evidence for one turn and the junction at
-        // the turn, no insertion; the closed reading of the same bases is a 360-base molecule, a 60-base insertion.
+    fn a_read_past_one_turn_that_is_not_closed_is_no_evidence() {
+        // A linear read of a 300-base circle running 1.2 turns (a concatemer): no evidence, so incomplete (not failed);
+        // the closed reading of the same bases is a 360-base molecule, a 60-base insertion.
         let r = bases(300, 40);
         let read = [&r[..], &r[..60]].concat();
         let mut j = Job::new(&r, true, (0, 300), 20, 0.05).unwrap();
         j.add("raw", &read, Some(&q(read.len(), 40)), false).unwrap();
-        let rep = j.report();
-        assert_eq!((rep.verdict, rep.differences.len(), rep.unsupported.len()), ("pass", 0, 0));
+        assert_eq!((j.report().verdict, j.reads()[0].reason.as_str()), ("incomplete", "it covers the circle more than once"));
         let mut j = Job::new(&r, true, (0, 300), 20, 0.05).unwrap();
         j.add("consensus", &read, Some(&q(read.len(), 40)), true).unwrap();
         assert!(matches!(&j.report().differences[..], [Diff::Ins { bases, .. }] if bases.len() == 60));
+    }
+
+    #[test]
+    fn p4_cases_trimmed_closure_mutated_palindrome_deletion_across_origin_and_called_anchors() {
+        // A closed consensus G + reference, the G at Q10: trimming removes it, so the read's ends no longer meet and the
+        // closing junction is unsupported (not a pass).
+        let r = bases(300, 41);
+        let read = [&b"G"[..], &r[..]].concat();
+        let mut qual = q(read.len(), 40);
+        qual[0] = 10;
+        let mut j = Job::new(&r, true, (0, 300), 20, 0.05).unwrap();
+        j.add("c", &read, Some(&qual), true).unwrap();
+        assert_eq!((j.report().verdict, j.report().unsupported), ("incomplete", vec![299]));
+        // A reference palindrome and a read of it with one base changed: forward and reverse readings put the change
+        // at mirrored positions, as good: ambiguous.
+        let half = bases(60, 42);
+        let pal = [&half[..], &rc(&half)].concat();
+        let ref2 = [&bases(150, 43)[..], &pal, &bases(150, 44)].concat();
+        let mut read = pal.clone();
+        read[10] = other(read[10]);
+        let mut j = job(&ref2, (150, 270));
+        j.add("p", &read, Some(&q(120, 40)), false).unwrap();
+        assert!(j.reads()[0].ambiguous);
+        // One deletion of 298, 299, 0, 1 on a 300-base circle: one event whether the region is the whole circle or
+        // stops short of it.
+        let r = bases(300, 45);
+        let read = [&r[2..298]].concat();
+        for region in [(0, 300), (1, 299)] {
+            let mut j = Job::new(&r, true, region, 20, 0.05).unwrap();
+            j.add("c", &read, None, true).unwrap();
+            assert_eq!(j.report().differences, vec![Diff::Del { positions: vec![298, 299, 0, 1] }], "{region:?}");
+        }
+        // A deletion beside an N in the read is no call.
+        let r = bases(400, 46);
+        let mut read: Vec<u8> = [&r[20..200], &r[201..380]].concat();
+        read[179] = b'N'; // the base before the deletion of 200
+        let mut j = job(&r, (200, 201));
+        j.add("f", &read, Some(&q(read.len(), 40)), false).unwrap();
+        assert_eq!((j.report().verdict, j.report().differences.len()), ("incomplete", 0));
     }
 
     #[test]
